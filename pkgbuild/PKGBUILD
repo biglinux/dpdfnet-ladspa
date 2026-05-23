@@ -75,19 +75,28 @@ source=(
 sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 prepare() {
-	# `startdir` is `pkgbuild/`; the crate root sits one directory up.
-	# rsync (not `cp -a`) lets us exclude `pkgbuild/` itself — without
-	# the exclusion the destination (`${srcdir}/${pkgbase}`) lives
-	# inside the source tree and the copy walks into its own target.
-	# The exclude list also drops developer artefacts so the package
-	# is reproducible from sources alone.
+	# Locate crate root by searching for Cargo.toml. Dev layout puts
+	# PKGBUILD in `pkgbuild/` (root is `${startdir}/..`); CI runners
+	# sometimes copy PKGBUILD straight into the repo root (root is
+	# `${startdir}` itself). Without this detection a stale CI layout
+	# made `${startdir}/../` resolve to `/`, sending rsync into `/sys`.
+	local _repo_root
+	if [ -f "${startdir}/../Cargo.toml" ]; then
+		_repo_root="$(realpath "${startdir}/..")"
+	elif [ -f "${startdir}/Cargo.toml" ]; then
+		_repo_root="$(realpath "${startdir}")"
+	else
+		msg2 "Cargo.toml not found near PKGBUILD (${startdir})"
+		return 1
+	fi
+
 	mkdir -p "${srcdir}/${pkgbase}"
 	rsync -a \
 		--exclude='pkgbuild' \
 		--exclude='target' \
 		--exclude='target-*' \
 		--exclude='.git' \
-		"${startdir}/../" "${srcdir}/${pkgbase}/"
+		"${_repo_root}/" "${srcdir}/${pkgbase}/"
 
 	# `Cargo.toml` carries `[patch.crates-io] ladspa = { path = "../gtcrn-ladspa/ladspa/ladspa-patched" }`
 	# — the patched crate lives in the sibling `gtcrn-ladspa` working
@@ -96,7 +105,7 @@ prepare() {
 	# sibling is expected to be checked out next to this repo; the
 	# PKGBUILD does not download it (it lives in a private GitHub repo
 	# and would otherwise need credentialed source= entries).
-	local _ladspa_src="${startdir}/../../gtcrn-ladspa/ladspa/ladspa-patched"
+	local _ladspa_src="${_repo_root}/../gtcrn-ladspa/ladspa/ladspa-patched"
 	if [ ! -f "${_ladspa_src}/Cargo.toml" ]; then
 		msg2 "Patched ladspa crate not found at ${_ladspa_src}"
 		msg2 "Check out gtcrn-ladspa next to dpdfnet-ladspa and retry."
