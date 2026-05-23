@@ -1,0 +1,203 @@
+# Maintainer: Bruno Goncalves <bigbruno@gmail.com>
+
+# Split package: one LADSPA shared object per upstream DPDFNet model.
+# The Rust crate (`../`) builds one .so per `DPDFNET_MODEL` invocation;
+# each package_*() function installs only its model's shared object so
+# users can pick the trade-off they want without dragging the others
+# into the system.
+
+pkgbase='dpdfnet-ladspa'
+pkgname=(
+	'dpdfnet-ladspa-baseline'
+	'dpdfnet-ladspa-dpdfnet2'
+	'dpdfnet-ladspa-dpdfnet4'
+	'dpdfnet-ladspa-dpdfnet8'
+	'dpdfnet-ladspa-dpdfnet2-48khz-hr'
+	'dpdfnet-ladspa-dpdfnet8-48khz-hr'
+)
+pkgver=$(date +%y.%m.%d)
+pkgrel=$(date +%H%M)
+arch=('x86_64')
+url='https://github.com/ceva-ip/DPDFNet'
+# Upstream (ceva-ip/DPDFNet) ships LICENSE as Apache-2.0 — both the
+# source code and the published ONNX weights on HF are covered.
+# Citation: Rika, Sapir, Gus (2025) "DPDFNet: Boosting DeepFilterNet2
+# via Dual-Path RNN".
+license=('Apache-2.0')
+makedepends=(
+	'cargo'
+	'rust'
+	'openvino'
+	'python'
+	'python-numpy'
+	'python-onnx'
+	'python-openvino'
+	'rsync'
+)
+options=('!lto')
+
+# Upstream weights live on Hugging Face. The `dpdfnet` Python package
+# wraps a download_model() helper, but plain HTTPS pulls keep the
+# build dependency surface small (no `python-filelock`, no Hugging Face
+# CLI) and let `makepkg` cache the artifacts the same way it caches
+# any other tarball.
+_hf_base='https://huggingface.co/Ceva-IP/DPDFNet/resolve/main/onnx'
+
+# Source array order MUST match _models below — the build loop indexes
+# both arrays positionally.
+_models=(
+	'baseline'
+	'dpdfnet2'
+	'dpdfnet4'
+	'dpdfnet8'
+	'dpdfnet2_48khz_hr'
+	'dpdfnet8_48khz_hr'
+)
+
+source=(
+	"baseline.onnx::${_hf_base}/baseline.onnx"
+	"dpdfnet2.onnx::${_hf_base}/dpdfnet2.onnx"
+	"dpdfnet4.onnx::${_hf_base}/dpdfnet4.onnx"
+	"dpdfnet8.onnx::${_hf_base}/dpdfnet8.onnx"
+	"dpdfnet2_48khz_hr.onnx::${_hf_base}/dpdfnet2_48khz_hr.onnx"
+	"dpdfnet8_48khz_hr.onnx::${_hf_base}/dpdfnet8_48khz_hr.onnx"
+	# Apache-2.0 §4(a) requires distributing the LICENSE alongside any
+	# binary derivative. Pull the upstream copy so each split package
+	# can install it under /usr/share/licenses/<pkg>/.
+	'LICENSE-DPDFNet::https://raw.githubusercontent.com/ceva-ip/DPDFNet/main/LICENSE'
+)
+
+# `SKIP` until the upstream HF repository pins specific revisions —
+# the model registry currently tracks `main`, so checksums would
+# invalidate on every Hugging Face commit even for unrelated metadata
+# tweaks. Re-pin with explicit sha256s once we move to a fixed
+# revision in `_hf_base`.
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+prepare() {
+	# `startdir` is `pkgbuild/`; the crate root sits one directory up.
+	# rsync (not `cp -a`) lets us exclude `pkgbuild/` itself — without
+	# the exclusion the destination (`${srcdir}/${pkgbase}`) lives
+	# inside the source tree and the copy walks into its own target.
+	# The exclude list also drops developer artefacts so the package
+	# is reproducible from sources alone.
+	mkdir -p "${srcdir}/${pkgbase}"
+	rsync -a \
+		--exclude='pkgbuild' \
+		--exclude='target' \
+		--exclude='target-*' \
+		--exclude='.git' \
+		"${startdir}/../" "${srcdir}/${pkgbase}/"
+
+	# `Cargo.toml` carries `[patch.crates-io] ladspa = { path = "../gtcrn-ladspa/ladspa/ladspa-patched" }`
+	# — the patched crate lives in the sibling `gtcrn-ladspa` working
+	# tree on a developer machine. Reproduce that relative layout under
+	# `${srcdir}/` so the patch resolves during the cargo build. The
+	# sibling is expected to be checked out next to this repo; the
+	# PKGBUILD does not download it (it lives in a private GitHub repo
+	# and would otherwise need credentialed source= entries).
+	local _ladspa_src="${startdir}/../../gtcrn-ladspa/ladspa/ladspa-patched"
+	if [ ! -f "${_ladspa_src}/Cargo.toml" ]; then
+		msg2 "Patched ladspa crate not found at ${_ladspa_src}"
+		msg2 "Check out gtcrn-ladspa next to dpdfnet-ladspa and retry."
+		return 1
+	fi
+	mkdir -p "${srcdir}/gtcrn-ladspa/ladspa"
+	rsync -a --exclude='target' --exclude='.git' \
+		"${_ladspa_src}/" \
+		"${srcdir}/gtcrn-ladspa/ladspa/ladspa-patched/"
+
+	cd "${srcdir}/${pkgbase}"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --target "$(rustc -vV | sed -n 's/host: //p')"
+
+	# Convert each ONNX into OpenVINO IR + extract init_state. The
+	# Rust build script reads `model/<name>/{model.xml,model.bin,init_state.bin}`
+	# at compile time, so this step must succeed for every model that
+	# any of the split packages will install.
+	for model in "${_models[@]}"; do
+		msg "Preparing ${model}"
+		python scripts/prepare_model.py \
+			--model "${model}" \
+			--src-onnx "${srcdir}/${model}.onnx"
+	done
+}
+
+build() {
+	cd "${srcdir}/${pkgbase}"
+	export RUSTUP_TOOLCHAIN=stable
+	CARGO_BUILD_JOBS=$(nproc)
+	export CARGO_BUILD_JOBS
+
+	# One cargo invocation per model. We isolate target/ per model so
+	# build.rs's generated `model_const.rs` from one model never gets
+	# served to another (incremental builds key on env var changes via
+	# `cargo:rerun-if-env-changed=DPDFNET_MODEL`, but separate target
+	# trees make the per-model artifact location unambiguous for the
+	# package_*() install steps below).
+	for model in "${_models[@]}"; do
+		msg "Building libdpdfnet_${model}_ladspa.so"
+		DPDFNET_MODEL="${model}" \
+			CARGO_TARGET_DIR="target-${model}" \
+			cargo build --release --frozen
+	done
+}
+
+_install_model() {
+	# $1: upstream model name (e.g. baseline, dpdfnet2_48khz_hr)
+	# $2: split package name (used for /usr/share/licenses path)
+	local model="$1" pkg="$2"
+	cd "${srcdir}/${pkgbase}"
+
+	install -Dm755 "target-${model}/release/libdpdfnet_ladspa.so" \
+		"${pkgdir}/usr/lib/ladspa/libdpdfnet_${model}_ladspa.so"
+
+	# Each split package ships its own Apache-2.0 license copy fetched
+	# from the upstream ceva-ip/DPDFNet repository (see source= array).
+	# Apache-2.0 §4(a) requires the recipient receive the LICENSE with
+	# every binary distribution.
+	install -Dm644 "${srcdir}/LICENSE-DPDFNet" \
+		"${pkgdir}/usr/share/licenses/${pkg}/LICENSE"
+}
+
+package_dpdfnet-ladspa-baseline() {
+	pkgdesc='DPDFNet 16 kHz baseline LADSPA plugin (fastest, 0-8 kHz band)'
+	depends=('gcc-libs' 'glibc' 'openvino')
+	provides=('ladspa-host')
+	_install_model baseline "${pkgname}"
+}
+
+package_dpdfnet-ladspa-dpdfnet2() {
+	pkgdesc='DPDFNet-2 16 kHz LADSPA plugin (balanced quality/speed, upstream default)'
+	depends=('gcc-libs' 'glibc' 'openvino')
+	provides=('ladspa-host')
+	_install_model dpdfnet2 "${pkgname}"
+}
+
+package_dpdfnet-ladspa-dpdfnet4() {
+	pkgdesc='DPDFNet-4 16 kHz LADSPA plugin (higher quality, deeper DPRNN stack)'
+	depends=('gcc-libs' 'glibc' 'openvino')
+	provides=('ladspa-host')
+	_install_model dpdfnet4 "${pkgname}"
+}
+
+package_dpdfnet-ladspa-dpdfnet8() {
+	pkgdesc='DPDFNet-8 16 kHz LADSPA plugin (highest quality 16 kHz variant)'
+	depends=('gcc-libs' 'glibc' 'openvino')
+	provides=('ladspa-host')
+	_install_model dpdfnet8 "${pkgname}"
+}
+
+package_dpdfnet-ladspa-dpdfnet2-48khz-hr() {
+	pkgdesc='DPDFNet-2 48 kHz hi-res LADSPA plugin (full-band, balanced)'
+	depends=('gcc-libs' 'glibc' 'openvino')
+	provides=('ladspa-host')
+	_install_model dpdfnet2_48khz_hr "${pkgname}"
+}
+
+package_dpdfnet-ladspa-dpdfnet8-48khz-hr() {
+	pkgdesc='DPDFNet-8 48 kHz hi-res LADSPA plugin (full-band, highest quality)'
+	depends=('gcc-libs' 'glibc' 'openvino')
+	provides=('ladspa-host')
+	_install_model dpdfnet8_48khz_hr "${pkgname}"
+}
