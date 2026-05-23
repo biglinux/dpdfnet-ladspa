@@ -32,6 +32,7 @@ makedepends=(
 	'python-numpy'
 	'python-onnx'
 	'python-openvino'
+	'python-typing_extensions'
 	'git'
 )
 options=('!lto')
