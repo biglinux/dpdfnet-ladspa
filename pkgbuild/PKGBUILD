@@ -37,6 +37,14 @@ makedepends=(
 )
 options=('!lto')
 
+# Every split ships the same shared object, so they share one dependency
+# list. The crate builds with the openvino crate's `runtime-linking`
+# feature, so the .so carries no versioned DT_NEEDED and an `openvino`
+# update cannot leave it present-but-unloadable again — which is what
+# 2026.1→2026.2 and 2026.2→2026.3 each did, crashing the
+# bigaudioimprove mic unit both times. A plain dependency is now enough.
+_split_depends=('gcc-libs' 'glibc' 'openvino')
+
 # Upstream weights live on Hugging Face. The `dpdfnet` Python package
 # wraps a download_model() helper, but plain HTTPS pulls keep the
 # build dependency surface small (no `python-filelock`, no Hugging Face
@@ -140,42 +148,42 @@ _install_model() {
 
 package_dpdfnet-ladspa-baseline() {
 	pkgdesc='DPDFNet 16 kHz baseline LADSPA plugin (fastest, 0-8 kHz band)'
-	depends=('gcc-libs' 'glibc' 'openvino')
+	depends=("${_split_depends[@]}")
 	provides=('ladspa-host')
 	_install_model baseline "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet2() {
 	pkgdesc='DPDFNet-2 16 kHz LADSPA plugin (balanced quality/speed, upstream default)'
-	depends=('gcc-libs' 'glibc' 'openvino')
+	depends=("${_split_depends[@]}")
 	provides=('ladspa-host')
 	_install_model dpdfnet2 "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet4() {
 	pkgdesc='DPDFNet-4 16 kHz LADSPA plugin (higher quality, deeper DPRNN stack)'
-	depends=('gcc-libs' 'glibc' 'openvino')
+	depends=("${_split_depends[@]}")
 	provides=('ladspa-host')
 	_install_model dpdfnet4 "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet8() {
 	pkgdesc='DPDFNet-8 16 kHz LADSPA plugin (highest quality 16 kHz variant)'
-	depends=('gcc-libs' 'glibc' 'openvino')
+	depends=("${_split_depends[@]}")
 	provides=('ladspa-host')
 	_install_model dpdfnet8 "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet2-48khz-hr() {
 	pkgdesc='DPDFNet-2 48 kHz hi-res LADSPA plugin (full-band, balanced)'
-	depends=('gcc-libs' 'glibc' 'openvino')
+	depends=("${_split_depends[@]}")
 	provides=('ladspa-host')
 	_install_model dpdfnet2_48khz_hr "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet8-48khz-hr() {
 	pkgdesc='DPDFNet-8 48 kHz hi-res LADSPA plugin (full-band, highest quality)'
-	depends=('gcc-libs' 'glibc' 'openvino')
+	depends=("${_split_depends[@]}")
 	provides=('ladspa-host')
 	_install_model dpdfnet8_48khz_hr "${pkgname}"
 }

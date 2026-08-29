@@ -15,6 +15,7 @@ __pycache__/
 
 # makepkg artefacts (downloaded ONNX, build dirs, packages)
 /pkgbuild/src/
+/pkgbuild/dpdfnet-ladspa/
 /pkgbuild/pkg/
 /pkgbuild/*.onnx
 /pkgbuild/LICENSE-DPDFNet
