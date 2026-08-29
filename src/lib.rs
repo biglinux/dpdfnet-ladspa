@@ -36,7 +36,8 @@ use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 mod engine;
-use engine::EngineLoader;
+use engine::Inference;
+pub use engine::ADDED_LATENCY_HOPS;
 
 mod model_const {
     // `MODEL_NAME` ships for diagnostics / log lines; the LADSPA hot
@@ -85,17 +86,18 @@ fn vorbis_window(win_len: usize) -> Vec<f32> {
 }
 
 struct DpdfnetPlugin {
-    /// Builds the engine on a worker thread and hands it back when the
-    /// host deactivates the node. `None` from it means "pass through".
-    loader: EngineLoader,
+    /// Runs the model on a worker thread, one hop behind the audio.
+    inference: Inference,
+    /// The previous hop's noisy spectrum: what the enhanced frame currently
+    /// coming back was computed from. Doubles as the fallback when the
+    /// worker has nothing ready.
+    dry_delay: Vec<f32>,
     /// False when the host runs at a rate this model cannot serve. The
     /// engine is then never asked for and audio passes through.
     rate_ok: bool,
     /// True once the unusable-runtime line has been written, so it is
     /// written once instead of on every callback.
     failure_logged: bool,
-    /// Per-stream GRU state, read and rewritten by every inference.
-    state: Vec<f32>,
     /// Sliding analysis window. We keep the most recent WIN_LEN samples
     /// and advance by HOP_SIZE per frame, so iteration n reads
     /// `[n*HOP .. n*HOP + WIN]` from the original input. A `VecDeque`
@@ -146,10 +148,10 @@ impl DpdfnetPlugin {
         let fft_inv = planner.plan_fft_inverse(model_const::WIN_LEN);
 
         Self {
-            loader: EngineLoader::new(),
+            inference: Inference::new(),
+            dry_delay: vec![0.0; model_const::FREQ_BINS * 2],
             rate_ok,
             failure_logged: false,
-            state: build_init_state(),
             // Pre-fill the analysis buffer with WIN_LEN zeros so the
             // first run() call can already process ceil(n/HOP)+1 frames
             // and produce >= n samples. Without this priming the queue
@@ -186,23 +188,26 @@ impl DpdfnetPlugin {
             self.spec_in[k * 2 + 1] = c.im;
         }
 
-        // No engine yet (still compiling on the worker), or the model
-        // refused the frame: carry the input spectrum through unchanged.
-        // The synthesis rings below still advance, so one unprocessed
-        // frame costs a little noise where a skipped one would put the
-        // overlap-add permanently out of step.
-        let enhanced = if self.rate_ok {
-            match self.loader.engine() {
-                Some(engine) => engine.run(&self.spec_in, &mut self.state, &mut self.spec_out),
-                None => false,
-            }
-        } else {
-            false
-        };
-        if !enhanced {
-            self.spec_out.copy_from_slice(&self.spec_in);
+        // Hand this frame to the worker and read back the one submitted a
+        // hop ago. When nothing is ready — the engine is still compiling, the
+        // inference ran long, or the runtime is unusable — the delayed dry
+        // spectrum takes its place. It is the same instant in time as the
+        // enhanced frame would have been, so the output never jumps, and the
+        // synthesis rings advance either way.
+        if self.rate_ok {
+            self.inference.submit(&self.spec_in);
         }
-        if self.loader.is_failed() && !self.failure_logged {
+        match self.inference.take() {
+            Some(frame) => {
+                self.spec_out.copy_from_slice(&frame);
+                self.inference.recycle(frame);
+            }
+            None => self.spec_out.copy_from_slice(&self.dry_delay),
+        }
+        // The noisy reference for the blend below has to be the frame the
+        // enhanced spectrum came from, not the one just captured.
+        std::mem::swap(&mut self.spec_in, &mut self.dry_delay);
+        if self.inference.is_failed() && !self.failure_logged {
             self.failure_logged = true;
             // The step that failed is already on the journal, one line up.
             eprintln!(
@@ -254,7 +259,7 @@ impl Plugin for DpdfnetPlugin {
     /// The host stopped this node. Hand the compiled model back so an idle
     /// chain stops holding it; the next activation rebuilds on the worker.
     fn deactivate(&mut self) {
-        self.loader.retire();
+        self.inference.reset();
     }
 
     fn run<'a>(&mut self, sample_count: usize, ports: &[&'a PortConnection<'a>]) {

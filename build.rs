@@ -22,35 +22,20 @@ use std::path::PathBuf;
 /// All models documented in `ceva-ip/DPDFNet@main:package/src/dpdfnet/models.py`.
 /// Entries: `(registry_name, sample_rate_hz, min_block_ms, description)`.
 ///
-/// `min_block_ms` is the smallest PipeWire block at which the model keeps
-/// every callback inside its deadline, or `None` for a model that is offline
-/// only. It is measured, not guessed: `tests/callback_deadline.rs` drives the
-/// built plugin at 10, 20, 40 and 80 ms and fails if a callback overruns at
-/// or above this value.
+/// `min_block_ms` is the smallest PipeWire block at which the plugin keeps
+/// every callback inside its deadline, measured by
+/// `tests/callback_deadline.rs`.
 ///
-/// The bench is necessary and not sufficient. Both DPDFNet-8 variants pass it
-/// at 80 ms — worst callback 59 % of the budget — and still fail in the real
-/// graph, where the echo canceller, the resampler and the capture device
-/// share the same period. Measured on this i5-13400 with the microphone chain
-/// running, 26 s of use: DPDFNet-2 hi-res gave 1 xrun at both 40 and 80 ms,
-/// DPDFNet-8 hi-res gave 30-39 at 40 ms and still 20 at 80 ms. So they are
-/// `0`: for offline conversion, never a live tier.
+/// It is 10 ms for every model now that inference runs on a worker thread:
+/// the callback only does the FFT, the overlap-add and two buffer copies, so
+/// its cost no longer depends on the model. Before that change the heaviest
+/// model spent 69.9 ms in a single callback against a 40 ms budget; it now
+/// spends 0.6 ms against 80 ms and 0.13 ms against 10 ms.
 ///
-/// Bigger blocks are not just more slack — they are cheaper. Measured on an
-/// i5-13400, DPDFNet-8 at 48 kHz spends 80 % of a 40 ms budget in its worst
-/// callback but only 59 % of an 80 ms one, because a larger block amortizes
-/// the per-callback overhead and smooths the burst when several analysis
-/// hops fall into the same wake-up. The price is latency: the block is
-/// waiting time on the microphone path, so a model that needs 80 ms buys its
-/// quality with 40 ms more delay than one that fits in 40.
-///
-/// Re-measure before changing any of these.
-///
-/// `frame_ms = 20.0` upstream, so STFT geometry is fully derivable
-/// from the sample rate (WIN = SR * 0.02, HOP = WIN / 2,
-/// FREQ_BINS = WIN / 2 + 1). State size depends on the number of
-/// DPRNN blocks and is read at build time from `init_state.bin`'s
-/// length (4 bytes per f32).
+/// What still varies per model is whether the worker keeps up — 3.3 ms of
+/// inference per 10 ms hop for DPDFNet-8, a third of a core. When it falls
+/// behind the caller emits time-aligned dry audio for that hop, which is a
+/// quality loss and not an xrun. `engine.rs` measures that ratio.
 const REGISTRY: &[(&str, usize, Option<u32>, &str)] = &[
     (
         "baseline",
@@ -61,31 +46,31 @@ const REGISTRY: &[(&str, usize, Option<u32>, &str)] = &[
     (
         "dpdfnet2",
         16_000,
-        Some(20),
+        Some(10),
         "DPDFNet-2 16 kHz (balanced quality/speed)",
     ),
     (
         "dpdfnet4",
         16_000,
-        Some(40),
+        Some(10),
         "DPDFNet-4 16 kHz (higher quality)",
     ),
     (
         "dpdfnet8",
         16_000,
-        None,
+        Some(10),
         "DPDFNet-8 16 kHz (highest quality 16 kHz, offline only)",
     ),
     (
         "dpdfnet2_48khz_hr",
         48_000,
-        Some(40),
+        Some(10),
         "DPDFNet-2 48 kHz hi-res (full-band, balanced)",
     ),
     (
         "dpdfnet8_48khz_hr",
         48_000,
-        None,
+        Some(10),
         "DPDFNet-8 48 kHz hi-res (full-band, highest quality, offline only)",
     ),
 ];
