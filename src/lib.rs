@@ -203,9 +203,10 @@ impl DpdfnetPlugin {
         }
         if self.loader.is_failed() && !self.failure_logged {
             self.failure_logged = true;
+            // The step that failed is already on the journal, one line up.
             eprintln!(
-                "[{}] the OpenVINO runtime could not be loaded; \
-                 passing the microphone through unprocessed",
+                "[{}] no inference engine; passing the microphone through \
+                 unprocessed",
                 model_const::LADSPA_LABEL
             );
         }

@@ -87,9 +87,25 @@ impl Engine {
     }
 }
 
+/// Report why a build step failed, once per attempt. A silent `None` here
+/// costs an afternoon: the chain comes up, passes audio through, and nothing
+/// says which of the eleven fallible steps gave up.
+fn step<T, E: std::fmt::Display>(what: &str, result: Result<T, E>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            eprintln!(
+                "[{}] engine build failed at {what}: {error}",
+                model_const::LADSPA_LABEL
+            );
+            None
+        }
+    }
+}
+
 /// Compile the embedded IR and bind its input tensors. `None` on any failure.
 fn build() -> Option<Engine> {
-    let mut core = Core::new().ok()?;
+    let mut core = step("Core::new", Core::new())?;
 
     // Configure the CPU plugin BEFORE compile so the optimization pipeline
     // picks up our hints:
@@ -121,25 +137,36 @@ fn build() -> Option<Engine> {
     // IR weights must be passed as a U8 Tensor wrapping the .bin bytes. Once
     // compile_model finishes, the CompiledModel holds its own copy of the
     // weights, so this scratch tensor can drop.
-    let weights_shape = Shape::new(&[model_const::IR_BIN.len() as i64]).ok()?;
-    let mut weights_tensor = Tensor::new(ElementType::U8, &weights_shape).ok()?;
-    weights_tensor
-        .get_data_mut::<u8>()
-        .ok()?
+    let weights_shape = step(
+        "weights shape",
+        Shape::new(&[model_const::IR_BIN.len() as i64]),
+    )?;
+    let mut weights_tensor = step(
+        "weights tensor",
+        Tensor::new(ElementType::U8, &weights_shape),
+    )?;
+    step("weights buffer", weights_tensor.get_data_mut::<u8>())?
         .copy_from_slice(model_const::IR_BIN);
 
-    let model = core
-        .read_model_from_buffer(model_const::IR_XML, Some(&weights_tensor))
-        .ok()?;
-    let mut compiled = core.compile_model(&model, cpu).ok()?;
-    let mut infer = compiled.create_infer_request().ok()?;
+    let model = step(
+        "read_model_from_buffer",
+        core.read_model_from_buffer(model_const::IR_XML, Some(&weights_tensor)),
+    )?;
+    let mut compiled = step("compile_model(CPU)", core.compile_model(&model, cpu))?;
+    let mut infer = step("create_infer_request", compiled.create_infer_request())?;
 
-    let spec_shape = Shape::new(&[1, 1, model_const::FREQ_BINS as i64, 2]).ok()?;
-    let state_shape = Shape::new(&[model_const::STATE_SIZE as i64]).ok()?;
-    let spec_tensor = Tensor::new(ElementType::F32, &spec_shape).ok()?;
-    let state_tensor = Tensor::new(ElementType::F32, &state_shape).ok()?;
-    infer.set_tensor("spec", &spec_tensor).ok()?;
-    infer.set_tensor("state_in", &state_tensor).ok()?;
+    let spec_shape = step(
+        "spec shape",
+        Shape::new(&[1, 1, model_const::FREQ_BINS as i64, 2]),
+    )?;
+    let state_shape = step("state shape", Shape::new(&[model_const::STATE_SIZE as i64]))?;
+    let spec_tensor = step("spec tensor", Tensor::new(ElementType::F32, &spec_shape))?;
+    let state_tensor = step("state tensor", Tensor::new(ElementType::F32, &state_shape))?;
+    step("set_tensor(spec)", infer.set_tensor("spec", &spec_tensor))?;
+    step(
+        "set_tensor(state_in)",
+        infer.set_tensor("state_in", &state_tensor),
+    )?;
 
     Some(Engine {
         infer,
