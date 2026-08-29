@@ -20,39 +20,55 @@ use std::fs;
 use std::path::PathBuf;
 
 /// All models documented in `ceva-ip/DPDFNet@main:package/src/dpdfnet/models.py`.
-/// Entries: `(registry_name, sample_rate_hz, description)`.
+/// Entries: `(registry_name, sample_rate_hz, realtime_capable, description)`.
+///
+/// `realtime_capable` is measured, not guessed: `tests/callback_deadline.rs`
+/// drives the built plugin at a 40 ms block, which is what the BigLinux mic
+/// chain negotiates. On an i5-13400 both DPDFNet-8 variants run a callback
+/// past that budget, so they are offline-only and must not be offered as a
+/// live quality tier. Re-measure before flipping any of these.
 ///
 /// `frame_ms = 20.0` upstream, so STFT geometry is fully derivable
 /// from the sample rate (WIN = SR * 0.02, HOP = WIN / 2,
 /// FREQ_BINS = WIN / 2 + 1). State size depends on the number of
 /// DPRNN blocks and is read at build time from `init_state.bin`'s
 /// length (4 bytes per f32).
-const REGISTRY: &[(&str, usize, &str)] = &[
+const REGISTRY: &[(&str, usize, bool, &str)] = &[
     (
         "baseline",
         16_000,
+        true,
         "DPDFNet 16 kHz baseline (fastest, lowest compute)",
     ),
     (
         "dpdfnet2",
         16_000,
+        true,
         "DPDFNet-2 16 kHz (balanced quality/speed)",
     ),
-    ("dpdfnet4", 16_000, "DPDFNet-4 16 kHz (higher quality)"),
+    (
+        "dpdfnet4",
+        16_000,
+        true,
+        "DPDFNet-4 16 kHz (higher quality)",
+    ),
     (
         "dpdfnet8",
         16_000,
-        "DPDFNet-8 16 kHz (highest quality 16 kHz)",
+        false,
+        "DPDFNet-8 16 kHz (highest quality 16 kHz, offline only)",
     ),
     (
         "dpdfnet2_48khz_hr",
         48_000,
+        true,
         "DPDFNet-2 48 kHz hi-res (full-band, balanced)",
     ),
     (
         "dpdfnet8_48khz_hr",
         48_000,
-        "DPDFNet-8 48 kHz hi-res (full-band, highest quality)",
+        false,
+        "DPDFNet-8 48 kHz hi-res (full-band, highest quality, offline only)",
     ),
 ];
 
@@ -78,15 +94,15 @@ fn main() {
 
     let entry = REGISTRY
         .iter()
-        .find(|(name, _, _)| *name == model_name)
+        .find(|(name, _, _, _)| *name == model_name)
         .unwrap_or_else(|| {
-            let known: Vec<&str> = REGISTRY.iter().map(|(n, _, _)| *n).collect();
+            let known: Vec<&str> = REGISTRY.iter().map(|(n, _, _, _)| *n).collect();
             panic!(
                 "unknown DPDFNet model `{model_name}`; valid choices: {}",
                 known.join(", ")
             );
         });
-    let (name, sample_rate, description) = (entry.0, entry.1, entry.2);
+    let (name, sample_rate, realtime, description) = (entry.0, entry.1, entry.2, entry.3);
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR unset");
     let model_dir = PathBuf::from(&manifest_dir).join("model").join(name);
@@ -133,6 +149,7 @@ pub const MODEL_NAME: &str = "{name}";
 pub const SAMPLE_RATE: usize = {sample_rate};
 pub const WIN_LEN: usize = {win_len};
 pub const HOP_SIZE: usize = {hop_size};
+pub const REALTIME_CAPABLE: bool = {realtime};
 pub const FREQ_BINS: usize = {freq_bins};
 pub const STATE_SIZE: usize = {state_size};
 pub const LADSPA_LABEL: &str = "{label}";

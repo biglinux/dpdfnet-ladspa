@@ -27,14 +27,16 @@
 //! Intel hybrid silicon we ship to.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use ladspa::{
     DefaultValue, Plugin, PluginDescriptor, Port, PortConnection, PortDescriptor, Properties,
 };
-use openvino::{CompiledModel, Core, ElementType, InferRequest, RwPropertyKey, Shape, Tensor};
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+
+mod engine;
+use engine::EngineLoader;
 
 mod model_const {
     // `MODEL_NAME` ships for diagnostics / log lines; the LADSPA hot
@@ -45,6 +47,16 @@ mod model_const {
     #![allow(dead_code, clippy::unreadable_literal)]
     include!(concat!(env!("OUT_DIR"), "/model_const.rs"));
 }
+
+/// The host sample rate this build's model requires. A filter chain running
+/// at anything else gets unprocessed audio, so the value belongs in the
+/// public surface rather than only in the failure message.
+pub const MODEL_SAMPLE_RATE: usize = model_const::SAMPLE_RATE;
+
+/// Whether this build's model keeps every callback inside the 40 ms block the
+/// mic chain negotiates. Measured by `tests/callback_deadline.rs`; false means
+/// the model is for offline conversion only, never a live quality tier.
+pub const REALTIME_CAPABLE: bool = model_const::REALTIME_CAPABLE;
 
 const PORT_INPUT: usize = 0;
 const PORT_OUTPUT: usize = 1;
@@ -59,117 +71,6 @@ fn build_init_state() -> Vec<f32> {
     state
 }
 
-/// Shared OpenVINO inference engine: one `InferRequest` plus the
-/// `spec`/`state_in` input tensors and the `CompiledModel` that owns
-/// them. Used by every LADSPA instance of this plugin in the process
-/// (mic and output filter chains both run inside the same `pwloader`
-/// process, and the data-loop calls plugins serially, so a single
-/// `InferRequest` is correct and saves the per-request oneDNN /
-/// TBB scratchpad — typically 10-15 MB).
-///
-/// Per-stream GRU state lives in `DpdfnetPlugin::state` (a plain
-/// `Vec<f32>`). Each `process_frame()` copies it into the shared
-/// `state_tensor` before `infer()` and copies `state_out` back into
-/// the plugin's vec after — that's how distinct mic and output
-/// streams keep independent recurrent context while sharing the
-/// inference engine.
-struct SharedEngine {
-    infer: InferRequest,
-    spec_tensor: Tensor,
-    state_tensor: Tensor,
-    /// Held to keep the model + weights alive for the program's
-    /// lifetime; the bound tensors above reference its memory.
-    _compiled: CompiledModel,
-}
-
-// SAFETY: the C API for `ov_infer_request_*` is callable from any
-// thread as long as concurrent calls are externally synchronized
-// (oneDNN/TBB primitives backing it are themselves thread-safe).
-// We synchronize via the surrounding `Mutex<SharedEngine>`. The
-// openvino crate marks `InferRequest` as `Send` already; this impl
-// extends that to `Sync` for storage in `OnceLock<Mutex<…>>`.
-unsafe impl Sync for SharedEngine {}
-
-fn build_engine() -> Mutex<SharedEngine> {
-    let mut core = Core::new().expect("OpenVINO Core::new failed");
-
-    // Configure the CPU plugin BEFORE compile so the optimization
-    // pipeline picks up our hints:
-    //
-    // * `SNIPPETS_MODE=DISABLE` — DPDFNet's GRU subgraph trips a bug in
-    //   the Snippets tokenizer ("Topological order is required, but not
-    //   set." raised from `pass/tokenization.cpp`) on OpenVINO 2026.0.0.
-    //   Disabling the Snippets pass routes those ops through the regular
-    //   oneDNN kernels — slightly less fused but functional.
-    // * `PERFORMANCE_HINT=LATENCY` + `NUM_STREAMS=1` +
-    //   `INFERENCE_NUM_THREADS=1` keep every op on the calling thread.
-    //   The LADSPA host already calls us on a FIFO 83 RT thread;
-    //   spawning OpenVINO worker threads at TBB defaults would cause
-    //   priority inversion under load.
-    // * `ENABLE_CPU_PINNING=NO` — `pwloader` already pins to P-cores via
-    //   `sched_setaffinity`. Letting the CPU plugin add its own pinning
-    //   on top can race with our mask.
-    let cpu = openvino::DeviceType::CPU;
-    for (key, val) in [
-        (RwPropertyKey::Other("SNIPPETS_MODE".into()), "DISABLE"),
-        (RwPropertyKey::HintPerformanceMode, "LATENCY"),
-        (RwPropertyKey::NumStreams, "1"),
-        (RwPropertyKey::InferenceNumThreads, "1"),
-        (RwPropertyKey::HintEnableCpuPinning, "NO"),
-    ] {
-        let _ = core.set_property(&cpu, &key, val);
-    }
-
-    // IR weights must be passed as a U8 Tensor wrapping the .bin bytes.
-    // Once compile_model finishes, the resulting CompiledModel holds
-    // its own copy of the weights so this scratch tensor can drop.
-    let weights_shape = Shape::new(&[model_const::IR_BIN.len() as i64])
-        .expect("OpenVINO weights Shape::new failed");
-    let mut weights_tensor = Tensor::new(openvino::ElementType::U8, &weights_shape)
-        .expect("OpenVINO weights Tensor::new failed");
-    weights_tensor
-        .get_data_mut::<u8>()
-        .expect("weights tensor get_data_mut failed")
-        .copy_from_slice(model_const::IR_BIN);
-
-    let model = core
-        .read_model_from_buffer(model_const::IR_XML, Some(&weights_tensor))
-        .expect("OpenVINO failed to read embedded DPDFNet IR");
-    let mut compiled = core
-        .compile_model(&model, cpu)
-        .expect("OpenVINO compile_model(CPU) failed");
-    let mut infer = compiled
-        .create_infer_request()
-        .expect("OpenVINO create_infer_request failed");
-
-    let spec_shape = Shape::new(&[1, 1, model_const::FREQ_BINS as i64, 2])
-        .expect("OpenVINO spec shape construction failed");
-    let state_shape = Shape::new(&[model_const::STATE_SIZE as i64])
-        .expect("OpenVINO state shape construction failed");
-    let spec_tensor =
-        Tensor::new(ElementType::F32, &spec_shape).expect("OpenVINO spec tensor allocation failed");
-    let state_tensor = Tensor::new(ElementType::F32, &state_shape)
-        .expect("OpenVINO state tensor allocation failed");
-    infer
-        .set_tensor("spec", &spec_tensor)
-        .expect("OpenVINO set_tensor(\"spec\") failed");
-    infer
-        .set_tensor("state_in", &state_tensor)
-        .expect("OpenVINO set_tensor(\"state_in\") failed");
-
-    Mutex::new(SharedEngine {
-        infer,
-        spec_tensor,
-        state_tensor,
-        _compiled: compiled,
-    })
-}
-
-fn shared_engine() -> &'static Mutex<SharedEngine> {
-    static SHARED: OnceLock<Mutex<SharedEngine>> = OnceLock::new();
-    SHARED.get_or_init(build_engine)
-}
-
 fn vorbis_window(win_len: usize) -> Vec<f32> {
     let half = win_len as f32 / 2.0;
     (0..win_len)
@@ -181,10 +82,16 @@ fn vorbis_window(win_len: usize) -> Vec<f32> {
 }
 
 struct DpdfnetPlugin {
-    /// Per-stream GRU state. Copied into the shared `state_tensor`
-    /// before every `infer()` and refreshed from `state_out` after —
-    /// that's how mic and output streams keep independent recurrent
-    /// context while sharing the per-model `InferRequest`.
+    /// Builds the engine on a worker thread and hands it back when the
+    /// host deactivates the node. `None` from it means "pass through".
+    loader: EngineLoader,
+    /// False when the host runs at a rate this model cannot serve. The
+    /// engine is then never asked for and audio passes through.
+    rate_ok: bool,
+    /// True once the unusable-runtime line has been written, so it is
+    /// written once instead of on every callback.
+    failure_logged: bool,
+    /// Per-stream GRU state, read and rewritten by every inference.
     state: Vec<f32>,
     /// Sliding analysis window. We keep the most recent WIN_LEN samples
     /// and advance by HOP_SIZE per frame, so iteration n reads
@@ -211,27 +118,34 @@ struct DpdfnetPlugin {
 impl DpdfnetPlugin {
     fn new(sample_rate: u64) -> Self {
         let sr = sample_rate as usize;
-        assert!(
-            sr == model_const::SAMPLE_RATE,
-            "DPDFNet plugin '{}' requires {} Hz host sample rate (got {sr}); \
-             set `audio.rate = {}` on the filter-chain node",
-            model_const::LADSPA_LABEL,
-            model_const::SAMPLE_RATE,
-            model_const::SAMPLE_RATE
-        );
+        // A wrong host rate used to abort the process. LADSPA cannot refuse
+        // an instantiation, so refuse the model instead: `rate_ok` false
+        // means the engine is never asked for and audio passes through.
+        let rate_ok = sr == model_const::SAMPLE_RATE;
+        if !rate_ok {
+            eprintln!(
+                "[{}] host sample rate is {sr} Hz, this plugin needs {}; \
+                 passing audio through unprocessed. Set `audio.rate = {}` \
+                 on the filter-chain node.",
+                model_const::LADSPA_LABEL,
+                model_const::SAMPLE_RATE,
+                model_const::SAMPLE_RATE
+            );
+        }
 
-        // Engine warm-up is deferred to the first `process_frame()` so
-        // a pwloader instance whose graph has no consumer (passive
-        // node, never called by the data-loop) doesn't pay the ~85 MB
-        // OpenVINO Core + JIT cost up front. The first frame after
-        // audio starts flowing pays a one-shot latency hit (engine
-        // build + IR compile, ~150-300 ms on Intel hybrid silicon)
-        // which is acceptable on stream startup.
+        // The engine is built on a worker thread, not here and not in the
+        // callback. An instance whose graph has no consumer never asks for
+        // one, so an idle chain does not pay the OpenVINO Core and JIT cost;
+        // when audio starts, the first frames pass through clean until the
+        // build lands (170-460 ms depending on the model).
         let mut planner = RealFftPlanner::<f32>::new();
         let fft_fwd = planner.plan_fft_forward(model_const::WIN_LEN);
         let fft_inv = planner.plan_fft_inverse(model_const::WIN_LEN);
 
         Self {
+            loader: EngineLoader::new(),
+            rate_ok,
+            failure_logged: false,
             state: build_init_state(),
             // Pre-fill the analysis buffer with WIN_LEN zeros so the
             // first run() call can already process ceil(n/HOP)+1 frames
@@ -269,45 +183,29 @@ impl DpdfnetPlugin {
             self.spec_in[k * 2 + 1] = c.im;
         }
 
-        // Hold the shared-engine lock for the duration of one
-        // inference. The data-loop calls plugins serially so this
-        // never contends; the lock just satisfies Rust's `&mut`
-        // requirement on global state.
-        {
-            let mut engine = shared_engine()
-                .lock()
-                .expect("shared engine mutex poisoned");
-
-            engine
-                .spec_tensor
-                .get_data_mut::<f32>()
-                .expect("spec tensor get_data_mut failed")
-                .copy_from_slice(&self.spec_in);
-            engine
-                .state_tensor
-                .get_data_mut::<f32>()
-                .expect("state tensor get_data_mut failed")
-                .copy_from_slice(&self.state);
-
-            engine.infer.infer().expect("OpenVINO infer() failed");
-
-            let spec_e = engine
-                .infer
-                .get_tensor("spec_e")
-                .expect("get_tensor(\"spec_e\") failed");
-            let spec_e_data = spec_e.get_data::<f32>().expect("spec_e get_data failed");
-            debug_assert_eq!(spec_e_data.len(), model_const::FREQ_BINS * 2);
-            self.spec_out[..spec_e_data.len()].copy_from_slice(spec_e_data);
-
-            let state_out = engine
-                .infer
-                .get_tensor("state_out")
-                .expect("get_tensor(\"state_out\") failed");
-            let state_out_data = state_out
-                .get_data::<f32>()
-                .expect("state_out get_data failed");
-            debug_assert_eq!(state_out_data.len(), model_const::STATE_SIZE);
-            self.state[..state_out_data.len()].copy_from_slice(state_out_data);
+        // No engine yet (still compiling on the worker), or the model
+        // refused the frame: carry the input spectrum through unchanged.
+        // The synthesis rings below still advance, so one unprocessed
+        // frame costs a little noise where a skipped one would put the
+        // overlap-add permanently out of step.
+        let enhanced = if self.rate_ok {
+            match self.loader.engine() {
+                Some(engine) => engine.run(&self.spec_in, &mut self.state, &mut self.spec_out),
+                None => false,
+            }
+        } else {
+            false
+        };
+        if !enhanced {
+            self.spec_out.copy_from_slice(&self.spec_in);
+        }
+        if self.loader.is_failed() && !self.failure_logged {
+            self.failure_logged = true;
+            eprintln!(
+                "[{}] the OpenVINO runtime could not be loaded; \
+                 passing the microphone through unprocessed",
+                model_const::LADSPA_LABEL
+            );
         }
 
         // alpha = 0 → fully enhanced; alpha = 1 → passthrough.
@@ -349,6 +247,12 @@ impl DpdfnetPlugin {
 }
 
 impl Plugin for DpdfnetPlugin {
+    /// The host stopped this node. Hand the compiled model back so an idle
+    /// chain stops holding it; the next activation rebuilds on the worker.
+    fn deactivate(&mut self) {
+        self.loader.retire();
+    }
+
     fn run<'a>(&mut self, sample_count: usize, ports: &[&'a PortConnection<'a>]) {
         let input = ports[PORT_INPUT].unwrap_audio();
         let mut output = ports[PORT_OUTPUT].unwrap_audio_mut();
@@ -410,7 +314,11 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
                 name: "Attenuation Limit (dB)",
                 desc: PortDescriptor::ControlInput,
                 hint: None,
-                default: Some(DefaultValue::Value0),
+                // 0 dB is full passthrough, so a host that never writes this
+                // control would get a denoiser that denoises nothing. Default
+                // to the top of the range: unlimited suppression, which is
+                // what someone loading a noise-suppression plugin asked for.
+                default: Some(DefaultValue::Maximum),
                 lower_bound: Some(0.0),
                 upper_bound: Some(100.0),
             },

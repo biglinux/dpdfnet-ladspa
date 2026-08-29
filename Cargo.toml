@@ -13,7 +13,9 @@ build = "build.rs"
 # `[lib]` block stays generic so `cargo build` works for any model.
 [lib]
 name = "dpdfnet_ladspa"
-crate-type = ["cdylib"]
+# `rlib` alongside the plugin so integration tests can drive the real
+# `run()` callback. It does not change the shipped `.so`.
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
