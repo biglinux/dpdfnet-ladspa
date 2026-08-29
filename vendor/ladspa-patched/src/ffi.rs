@@ -110,8 +110,14 @@ pub unsafe extern "C" fn ladspa_descriptor(index: c_ulong) -> *mut ladspa_h::Des
     }
 
     // If it's already been generated, return the cached copy.
+    //
+    // Bug fix: this used to return a pointer to the Vec slot (`&*…add(idx)`)
+    // rather than the cached `*mut Descriptor` value stored in that slot, so
+    // every repeat call in one process handed the host garbage. Two instances
+    // of this plugin in one ffmpeg graph, or two filter chains in one PipeWire
+    // daemon, failed with "Could not find plugin".
     if (index as usize) < (*DESCRIPTORS).len() {
-        return mem::transmute(&*(*DESCRIPTORS).as_ptr().add(index as usize));
+        return *(*DESCRIPTORS).as_ptr().add(index as usize);
     }
 
     let descriptor = call_user_code!(get_ladspa_descriptor(index as u64), "get_ladspa_descriptor");
