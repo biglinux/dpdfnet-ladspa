@@ -54,12 +54,12 @@ mod model_const {
 pub const MODEL_SAMPLE_RATE: usize = model_const::SAMPLE_RATE;
 
 /// Smallest PipeWire block, in milliseconds, at which this build's model keeps
-/// every callback inside its deadline, or `0` when no block we would ship is
-/// enough and the model is for offline conversion only.
+/// every callback inside its deadline, or `None` when no block we would ship
+/// is enough and the model is for offline conversion only.
 ///
 /// A quality tier that offers this model must negotiate at least this block,
 /// and pay it as microphone latency.
-pub const MIN_BLOCK_MS: u32 = model_const::MIN_BLOCK_MS;
+pub const MIN_BLOCK_MS: Option<u32> = model_const::MIN_BLOCK_MS;
 
 const PORT_INPUT: usize = 0;
 const PORT_OUTPUT: usize = 1;

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 /// Entries: `(registry_name, sample_rate_hz, min_block_ms, description)`.
 ///
 /// `min_block_ms` is the smallest PipeWire block at which the model keeps
-/// every callback inside its deadline, or `0` for a model that is offline
+/// every callback inside its deadline, or `None` for a model that is offline
 /// only. It is measured, not guessed: `tests/callback_deadline.rs` drives the
 /// built plugin at 10, 20, 40 and 80 ms and fails if a callback overruns at
 /// or above this value.
@@ -51,36 +51,41 @@ use std::path::PathBuf;
 /// FREQ_BINS = WIN / 2 + 1). State size depends on the number of
 /// DPRNN blocks and is read at build time from `init_state.bin`'s
 /// length (4 bytes per f32).
-const REGISTRY: &[(&str, usize, u32, &str)] = &[
+const REGISTRY: &[(&str, usize, Option<u32>, &str)] = &[
     (
         "baseline",
         16_000,
-        10,
+        Some(10),
         "DPDFNet 16 kHz baseline (fastest, lowest compute)",
     ),
     (
         "dpdfnet2",
         16_000,
-        20,
+        Some(20),
         "DPDFNet-2 16 kHz (balanced quality/speed)",
     ),
-    ("dpdfnet4", 16_000, 40, "DPDFNet-4 16 kHz (higher quality)"),
+    (
+        "dpdfnet4",
+        16_000,
+        Some(40),
+        "DPDFNet-4 16 kHz (higher quality)",
+    ),
     (
         "dpdfnet8",
         16_000,
-        0,
+        None,
         "DPDFNet-8 16 kHz (highest quality 16 kHz, offline only)",
     ),
     (
         "dpdfnet2_48khz_hr",
         48_000,
-        40,
+        Some(40),
         "DPDFNet-2 48 kHz hi-res (full-band, balanced)",
     ),
     (
         "dpdfnet8_48khz_hr",
         48_000,
-        0,
+        None,
         "DPDFNet-8 48 kHz hi-res (full-band, highest quality, offline only)",
     ),
 ];
@@ -162,7 +167,7 @@ pub const MODEL_NAME: &str = "{name}";
 pub const SAMPLE_RATE: usize = {sample_rate};
 pub const WIN_LEN: usize = {win_len};
 pub const HOP_SIZE: usize = {hop_size};
-pub const MIN_BLOCK_MS: u32 = {min_block_ms};
+pub const MIN_BLOCK_MS: Option<u32> = {min_block_ms:?};
 pub const FREQ_BINS: usize = {freq_bins};
 pub const STATE_SIZE: usize = {state_size};
 pub const LADSPA_LABEL: &str = "{label}";
