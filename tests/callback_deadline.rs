@@ -110,13 +110,14 @@ fn the_first_callback_never_stalls_and_the_shipped_block_never_overruns() {
         );
 
         // Smaller blocks are reported for comparison. The promise starts at
-        // the model's measured minimum: below it the heavier models overrun,
-        // which is exactly why the registry records the number.
+        // the model's measured minimum; `0` means the model has no live block
+        // at all and this bench makes no claim about it.
+        //
         // One overrun in a hundred is a scheduler hiccup on a shared build
         // machine, not a DSP regression. A budget rather than zero keeps the
         // gate meaningful instead of flaky — a real regression moves the
         // whole distribution, not one sample.
-        if ms as u32 >= MIN_BLOCK_MS {
+        if MIN_BLOCK_MS > 0 && ms as u32 >= MIN_BLOCK_MS {
             assert!(
                 over * 100 <= blocks,
                 "{over} of {blocks} callbacks exceeded {deadline:?} at {ms} ms; worst {worst:?}"

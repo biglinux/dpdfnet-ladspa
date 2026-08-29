@@ -54,7 +54,8 @@ mod model_const {
 pub const MODEL_SAMPLE_RATE: usize = model_const::SAMPLE_RATE;
 
 /// Smallest PipeWire block, in milliseconds, at which this build's model keeps
-/// every callback inside its deadline. Measured by `tests/callback_deadline.rs`.
+/// every callback inside its deadline, or `0` when no block we would ship is
+/// enough and the model is for offline conversion only.
 ///
 /// A quality tier that offers this model must negotiate at least this block,
 /// and pay it as microphone latency.

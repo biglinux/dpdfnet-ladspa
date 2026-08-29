@@ -23,9 +23,18 @@ use std::path::PathBuf;
 /// Entries: `(registry_name, sample_rate_hz, min_block_ms, description)`.
 ///
 /// `min_block_ms` is the smallest PipeWire block at which the model keeps
-/// every callback inside its deadline. It is measured, not guessed:
-/// `tests/callback_deadline.rs` drives the built plugin at 10, 20, 40 and
-/// 80 ms and fails if a callback overruns at or above this value.
+/// every callback inside its deadline, or `0` for a model that is offline
+/// only. It is measured, not guessed: `tests/callback_deadline.rs` drives the
+/// built plugin at 10, 20, 40 and 80 ms and fails if a callback overruns at
+/// or above this value.
+///
+/// The bench is necessary and not sufficient. Both DPDFNet-8 variants pass it
+/// at 80 ms — worst callback 59 % of the budget — and still fail in the real
+/// graph, where the echo canceller, the resampler and the capture device
+/// share the same period. Measured on this i5-13400 with the microphone chain
+/// running, 26 s of use: DPDFNet-2 hi-res gave 1 xrun at both 40 and 80 ms,
+/// DPDFNet-8 hi-res gave 30-39 at 40 ms and still 20 at 80 ms. So they are
+/// `0`: for offline conversion, never a live tier.
 ///
 /// Bigger blocks are not just more slack — they are cheaper. Measured on an
 /// i5-13400, DPDFNet-8 at 48 kHz spends 80 % of a 40 ms budget in its worst
@@ -59,7 +68,7 @@ const REGISTRY: &[(&str, usize, u32, &str)] = &[
     (
         "dpdfnet8",
         16_000,
-        80,
+        0,
         "DPDFNet-8 16 kHz (highest quality 16 kHz, offline only)",
     ),
     (
@@ -71,7 +80,7 @@ const REGISTRY: &[(&str, usize, u32, &str)] = &[
     (
         "dpdfnet8_48khz_hr",
         48_000,
-        80,
+        0,
         "DPDFNet-8 48 kHz hi-res (full-band, highest quality, offline only)",
     ),
 ];
