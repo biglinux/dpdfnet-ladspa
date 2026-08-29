@@ -53,10 +53,12 @@ mod model_const {
 /// public surface rather than only in the failure message.
 pub const MODEL_SAMPLE_RATE: usize = model_const::SAMPLE_RATE;
 
-/// Whether this build's model keeps every callback inside the 40 ms block the
-/// mic chain negotiates. Measured by `tests/callback_deadline.rs`; false means
-/// the model is for offline conversion only, never a live quality tier.
-pub const REALTIME_CAPABLE: bool = model_const::REALTIME_CAPABLE;
+/// Smallest PipeWire block, in milliseconds, at which this build's model keeps
+/// every callback inside its deadline. Measured by `tests/callback_deadline.rs`.
+///
+/// A quality tier that offers this model must negotiate at least this block,
+/// and pay it as microphone latency.
+pub const MIN_BLOCK_MS: u32 = model_const::MIN_BLOCK_MS;
 
 const PORT_INPUT: usize = 0;
 const PORT_OUTPUT: usize = 1;
