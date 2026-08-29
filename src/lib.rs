@@ -49,22 +49,37 @@ mod model_const {
     include!(concat!(env!("OUT_DIR"), "/model_const.rs"));
 }
 
+/// Samples of latency this plugin adds, for the host to declare to its graph.
+///
+/// Exported with the C ABI on purpose: the chain that has to publish this
+/// number is built from a different repository, and a copy in a JSON file or
+/// a second constant would drift from the binary at the first partial
+/// upgrade. Reading it out of the `.so` cannot drift, because it is the
+/// `.so`. A caller that finds no such symbol is looking at an older plugin.
+#[no_mangle]
+pub extern "C" fn dpdfnet_added_latency_frames() -> u32 {
+    // The worker handoff, plus the analysis window the constructor primes.
+    (ADDED_LATENCY_HOPS * model_const::HOP_SIZE + model_const::WIN_LEN) as u32
+}
+
 /// The host sample rate this build's model requires. A filter chain running
 /// at anything else gets unprocessed audio, so the value belongs in the
 /// public surface rather than only in the failure message.
 pub const MODEL_SAMPLE_RATE: usize = model_const::SAMPLE_RATE;
 
-/// Smallest PipeWire block, in milliseconds, at which this build's model keeps
-/// every callback inside its deadline, or `None` when no block we would ship
-/// is enough and the model is for offline conversion only.
-///
-/// A quality tier that offers this model must negotiate at least this block,
-/// and pay it as microphone latency.
-pub const MIN_BLOCK_MS: Option<u32> = model_const::MIN_BLOCK_MS;
+/// Largest host block we reserve for, so a realtime `run()` never grows a
+/// buffer. Matches PipeWire's `default.clock.quantum-limit` default of 8192;
+/// an offline host such as ffmpeg can exceed it and the buffers still grow,
+/// which is why the growth path stays.
+const MAX_HOST_BLOCK: usize = 8192;
 
 const PORT_INPUT: usize = 0;
 const PORT_OUTPUT: usize = 1;
 const PORT_ATTEN_LIMIT_DB: usize = 2;
+/// Hops the plugin asked the worker for since this stream started.
+const PORT_HOPS_TOTAL: usize = 3;
+/// Of those, how many came back enhanced. The rest were the dry fallback.
+const PORT_HOPS_ENHANCED: usize = 4;
 
 fn build_init_state() -> Vec<f32> {
     assert_eq!(model_const::INIT_STATE.len(), model_const::STATE_SIZE * 4);
@@ -159,9 +174,17 @@ impl DpdfnetPlugin {
             // leaking ~64 zero samples per 1024 sample call (audible as
             // periodic clicks / robotic timbre at the host quantum
             // rate). Latency cost: WIN_LEN/sr ≈ 20 ms.
-            in_buf: vec![0.0; model_const::WIN_LEN],
+            in_buf: {
+                // Primed with WIN_LEN zeros but reserved for a whole block on
+                // top: the first `run()` appends before it consumes, and that
+                // first callback is exactly the one this plugin must not
+                // stall in.
+                let mut buf = Vec::with_capacity(MAX_HOST_BLOCK + model_const::WIN_LEN);
+                buf.resize(model_const::WIN_LEN, 0.0);
+                buf
+            },
             ola_buf: vec![0.0; model_const::WIN_LEN],
-            out_queue: VecDeque::with_capacity(model_const::WIN_LEN * 2),
+            out_queue: VecDeque::with_capacity(MAX_HOST_BLOCK + model_const::WIN_LEN),
             window: vorbis_window(model_const::WIN_LEN),
             fft_real: vec![0.0; model_const::WIN_LEN],
             fft_complex: vec![Complex::new(0.0, 0.0); model_const::FREQ_BINS],
@@ -258,8 +281,16 @@ impl DpdfnetPlugin {
 }
 
 impl Plugin for DpdfnetPlugin {
-    /// The host stopped this node. Hand the compiled model back so an idle
-    /// chain stops holding it; the next activation rebuilds on the worker.
+    /// The host is about to start this node. Ask the worker to compile now,
+    /// so the build overlaps the graph coming up rather than the first words
+    /// the user speaks.
+    fn activate(&mut self) {
+        self.inference.prime();
+    }
+
+    /// The host stopped this node. Forget the recurrent state so the next
+    /// stream starts clean. The compiled model stays for a minute in case
+    /// this was a mute rather than a hang-up.
     fn deactivate(&mut self) {
         self.inference.reset();
     }
@@ -290,6 +321,10 @@ impl Plugin for DpdfnetPlugin {
         for slot in output.iter_mut().take(n) {
             *slot = self.out_queue.pop_front().unwrap_or(0.0);
         }
+
+        let (total, enhanced) = self.inference.hops();
+        **ports[PORT_HOPS_TOTAL].unwrap_control_mut() = total as f32;
+        **ports[PORT_HOPS_ENHANCED].unwrap_control_mut() = enhanced as f32;
     }
 }
 
@@ -333,7 +368,89 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
                 lower_bound: Some(0.0),
                 upper_bound: Some(100.0),
             },
+            // With inference off the audio thread, a worker that cannot keep
+            // up is invisible in xruns: the callback always finishes and the
+            // user hears the dry fallback. These two say how often that
+            // happened. The plugin reports; whoever reads decides what is bad.
+            Port {
+                name: "Hops Total",
+                desc: PortDescriptor::ControlOutput,
+                ..Default::default()
+            },
+            Port {
+                name: "Hops Enhanced",
+                desc: PortDescriptor::ControlOutput,
+                ..Default::default()
+            },
         ],
         new: |_, sample_rate| Box::new(DpdfnetPlugin::new(sample_rate)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ladspa::PortData;
+    use std::cell::RefCell;
+
+    /// A realtime callback must not touch the allocator, and the first one is
+    /// the whole point of this plugin's design. `Vec::capacity` is the
+    /// observation: if any buffer grows, it reallocated.
+    ///
+    /// Drives the concrete type, not the boxed trait object, so the buffers
+    /// being watched are the ones the callback actually wrote to.
+    #[test]
+    fn no_callback_grows_a_buffer() {
+        let descriptor = get_ladspa_descriptor(0).expect("descriptor");
+        let ports = descriptor.ports.clone();
+        let mut plugin = DpdfnetPlugin::new(MODEL_SAMPLE_RATE as u64);
+        plugin.activate();
+
+        // The largest block we reserve for, driven at once so the first
+        // callback is also the worst callback.
+        let quantum = MAX_HOST_BLOCK;
+        let controls = [100.0_f32];
+        let input = vec![0.1_f32; quantum];
+        let mut output = vec![0.0_f32; quantum];
+        let (mut total, mut enhanced) = (0.0_f32, 0.0_f32);
+
+        let reserved = (
+            plugin.in_buf.capacity(),
+            plugin.ola_buf.capacity(),
+            plugin.out_queue.capacity(),
+        );
+
+        for call in 0..4 {
+            {
+                let mut output_slot = Some(&mut output[..]);
+                let mut report_slots = [Some(&mut total), Some(&mut enhanced)];
+                let mut connections: Vec<PortConnection> = Vec::with_capacity(ports.len());
+                for (i, port) in ports.iter().enumerate() {
+                    let data = match i {
+                        0 => PortData::AudioInput(&input),
+                        1 => PortData::AudioOutput(RefCell::new(
+                            output_slot.take().expect("one output port"),
+                        )),
+                        2 => PortData::ControlInput(&controls[0]),
+                        _ => PortData::ControlOutput(RefCell::new(
+                            report_slots[i - 3].take().expect("one cell per port"),
+                        )),
+                    };
+                    connections.push(PortConnection { port: *port, data });
+                }
+                let refs: Vec<&PortConnection> = connections.iter().collect();
+                plugin.run(quantum, &refs);
+            }
+
+            let now = (
+                plugin.in_buf.capacity(),
+                plugin.ola_buf.capacity(),
+                plugin.out_queue.capacity(),
+            );
+            assert_eq!(
+                now, reserved,
+                "callback {call} reallocated: {reserved:?} became {now:?}"
+            );
+        }
+    }
 }

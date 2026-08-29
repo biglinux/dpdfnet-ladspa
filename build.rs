@@ -20,57 +20,44 @@ use std::fs;
 use std::path::PathBuf;
 
 /// All models documented in `ceva-ip/DPDFNet@main:package/src/dpdfnet/models.py`.
-/// Entries: `(registry_name, sample_rate_hz, min_block_ms, description)`.
+/// Entries: `(registry_name, sample_rate_hz, description)`.
 ///
-/// `min_block_ms` is the smallest PipeWire block at which the plugin keeps
-/// every callback inside its deadline, measured by
-/// `tests/callback_deadline.rs`.
+/// There is deliberately no per-model block size here any more. Inference
+/// runs on a worker thread, so the audio callback does the FFT, the
+/// overlap-add and two buffer copies and nothing else — its cost no longer
+/// depends on the model. `tests/callback_deadline.rs` holds every model to
+/// every block from 10 ms up.
 ///
-/// It is 10 ms for every model now that inference runs on a worker thread:
-/// the callback only does the FFT, the overlap-add and two buffer copies, so
-/// its cost no longer depends on the model. Before that change the heaviest
-/// model spent 69.9 ms in a single callback against a 40 ms budget; it now
-/// spends 0.6 ms against 80 ms and 0.13 ms against 10 ms.
-///
-/// What still varies per model is whether the worker keeps up — 3.3 ms of
-/// inference per 10 ms hop for DPDFNet-8, a third of a core. When it falls
-/// behind the caller emits time-aligned dry audio for that hop, which is a
-/// quality loss and not an xrun. `engine.rs` measures that ratio.
-const REGISTRY: &[(&str, usize, Option<u32>, &str)] = &[
+/// What still varies per model is whether the worker keeps up: 3.3 ms of
+/// inference per 10 ms hop for DPDFNet-8, a third of a core. That is a
+/// CPU-load question for the quality tier, and the plugin reports it on the
+/// `Hops Total` and `Hops Enhanced` control ports rather than promising it
+/// here.
+const REGISTRY: &[(&str, usize, &str)] = &[
     (
         "baseline",
         16_000,
-        Some(10),
         "DPDFNet 16 kHz baseline (fastest, lowest compute)",
     ),
     (
         "dpdfnet2",
         16_000,
-        Some(10),
         "DPDFNet-2 16 kHz (balanced quality/speed)",
     ),
-    (
-        "dpdfnet4",
-        16_000,
-        Some(10),
-        "DPDFNet-4 16 kHz (higher quality)",
-    ),
+    ("dpdfnet4", 16_000, "DPDFNet-4 16 kHz (higher quality)"),
     (
         "dpdfnet8",
         16_000,
-        Some(10),
         "DPDFNet-8 16 kHz (highest quality 16 kHz, offline only)",
     ),
     (
         "dpdfnet2_48khz_hr",
         48_000,
-        Some(10),
         "DPDFNet-2 48 kHz hi-res (full-band, balanced)",
     ),
     (
         "dpdfnet8_48khz_hr",
         48_000,
-        Some(10),
         "DPDFNet-8 48 kHz hi-res (full-band, highest quality, offline only)",
     ),
 ];
@@ -97,15 +84,15 @@ fn main() {
 
     let entry = REGISTRY
         .iter()
-        .find(|(name, _, _, _)| *name == model_name)
+        .find(|(name, _, _)| *name == model_name)
         .unwrap_or_else(|| {
-            let known: Vec<&str> = REGISTRY.iter().map(|(n, _, _, _)| *n).collect();
+            let known: Vec<&str> = REGISTRY.iter().map(|(n, _, _)| *n).collect();
             panic!(
                 "unknown DPDFNet model `{model_name}`; valid choices: {}",
                 known.join(", ")
             );
         });
-    let (name, sample_rate, min_block_ms, description) = (entry.0, entry.1, entry.2, entry.3);
+    let (name, sample_rate, description) = (entry.0, entry.1, entry.2);
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR unset");
     let model_dir = PathBuf::from(&manifest_dir).join("model").join(name);
@@ -152,7 +139,6 @@ pub const MODEL_NAME: &str = "{name}";
 pub const SAMPLE_RATE: usize = {sample_rate};
 pub const WIN_LEN: usize = {win_len};
 pub const HOP_SIZE: usize = {hop_size};
-pub const MIN_BLOCK_MS: Option<u32> = {min_block_ms:?};
 pub const FREQ_BINS: usize = {freq_bins};
 pub const STATE_SIZE: usize = {state_size};
 pub const LADSPA_LABEL: &str = "{label}";

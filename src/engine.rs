@@ -25,9 +25,10 @@
 //! takes the user's microphone with it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use openvino::{CompiledModel, Core, ElementType, InferRequest, RwPropertyKey, Shape, Tensor};
 
@@ -207,11 +208,22 @@ const POOL: usize = 4;
 /// rather than allocated, so the audio thread never touches the allocator.
 type Frame = Box<[f32]>;
 
+/// How long an idle worker keeps the compiled model before releasing it.
+///
+/// A call that mutes and unmutes is the common case, and rebuilding costs
+/// 170-460 ms of unprocessed audio each time. A minute covers that while a
+/// chain nobody is recording from still gives its ~100 MB back.
+const LINGER: Duration = Duration::from_secs(60);
+
 enum Job {
     /// Interleaved re/im spectrum to enhance. Comes back through `done`.
     Run(Frame),
-    /// The node stopped. Drop the engine and forget the recurrent state; the
-    /// next `submit` rebuilds.
+    /// Start compiling now, before audio arrives. Sent from `activate()`, so
+    /// the build overlaps the graph coming up instead of the first speech.
+    Prime,
+    /// A new stream. Forget the recurrent state and clear a previous failure,
+    /// so each activation gets one fresh attempt. The engine stays: releasing
+    /// it is what [`LINGER`] is for.
     Reset,
 }
 
@@ -219,7 +231,14 @@ enum Job {
 ///
 /// Dropping this closes the job channel, which ends the worker.
 pub struct Inference {
-    jobs: SyncSender<Job>,
+    /// Joined on drop. Without it the process can tear down while the worker
+    /// is inside OpenVINO — observed as an intermittent SIGSEGV when a test
+    /// binary exits mid-build, and the same race exists when `pwloader`
+    /// stops.
+    worker: Option<thread::JoinHandle<()>>,
+    /// `Option` only so `Drop` can close it before joining; a live sender
+    /// would leave the worker waiting on a queue nobody will fill.
+    jobs: Option<SyncSender<Job>>,
     done: Receiver<Frame>,
     /// Buffers not currently in flight.
     pool: Vec<Frame>,
@@ -227,9 +246,23 @@ pub struct Inference {
     /// [`MAX_IN_FLIGHT`], which is what keeps the handoff one hop deep.
     outstanding: usize,
     /// The engine could not be built. Submitting again would re-run a
-    /// 170 ms compile on the worker forever.
+    /// 170-460 ms compile on the worker every hop.
     failed: Arc<AtomicBool>,
+    /// When this side first saw `failed`. The latch expires after
+    /// [`RETRY_AFTER`], so a transient failure — a half-installed runtime
+    /// during an upgrade, a moment without memory — heals itself instead of
+    /// leaving the microphone dry until the process restarts.
+    failed_since: Option<Instant>,
+    /// Hops asked for since the last reset, and how many came back enhanced.
+    /// Published on control ports: with the work off the audio thread, a
+    /// worker that cannot keep up shows up here and nowhere else — xruns stay
+    /// at zero while the user hears the dry fallback.
+    hops_total: u64,
+    hops_enhanced: u64,
 }
+
+/// How long a failed build is trusted to stay failed.
+const RETRY_AFTER: Duration = Duration::from_secs(5);
 
 impl Inference {
     #[must_use]
@@ -239,25 +272,38 @@ impl Inference {
         let failed = Arc::new(AtomicBool::new(false));
         let worker_failed = Arc::clone(&failed);
 
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             let mut engine: Option<Engine> = None;
             let mut state = crate::build_init_state();
             // Allocated once; the worker is not the audio thread but a
             // per-frame allocation is still pointless.
             let mut scratch: Vec<f32> = Vec::new();
-            for job in job_rx {
-                match job {
-                    Job::Reset => {
+            loop {
+                let job = match job_rx.recv_timeout(LINGER) {
+                    Ok(job) => job,
+                    // Nothing for a whole minute: give the model back.
+                    Err(RecvTimeoutError::Timeout) => {
                         engine = None;
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                };
+                let ensure = |engine: &mut Option<Engine>| {
+                    if engine.is_none() && !worker_failed.load(Ordering::Relaxed) {
+                        *engine = build();
+                        if engine.is_none() {
+                            worker_failed.store(true, Ordering::Relaxed);
+                        }
+                    }
+                };
+                match job {
+                    Job::Prime => ensure(&mut engine),
+                    Job::Reset => {
                         state = crate::build_init_state();
+                        worker_failed.store(false, Ordering::Relaxed);
                     }
                     Job::Run(mut frame) => {
-                        if engine.is_none() && !worker_failed.load(Ordering::Relaxed) {
-                            engine = build();
-                            if engine.is_none() {
-                                worker_failed.store(true, Ordering::Relaxed);
-                            }
-                        }
+                        ensure(&mut engine);
                         // On failure the frame goes back unchanged, which the
                         // caller treats exactly like a late result: dry audio,
                         // time-aligned, rings still advancing.
@@ -280,28 +326,55 @@ impl Inference {
         });
 
         Self {
-            jobs,
+            worker: Some(worker),
+            jobs: Some(jobs),
             done,
             pool: (0..POOL)
                 .map(|_| vec![0.0_f32; model_const::FREQ_BINS * 2].into_boxed_slice())
                 .collect(),
             outstanding: 0,
             failed,
+            failed_since: None,
+            hops_total: 0,
+            hops_enhanced: 0,
         }
+    }
+
+    /// Post a job, never blocking. False when the queue is full or the worker
+    /// has already gone.
+    fn send(&self, job: Job) -> bool {
+        self.jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.try_send(job).is_ok())
+    }
+
+    /// Ask the worker to compile now. Called from `activate()`, before any
+    /// audio, so the build overlaps the graph starting rather than speech.
+    pub fn prime(&mut self) {
+        self.send(Job::Prime);
+    }
+
+    /// Hops asked for and hops that came back enhanced, since the last reset.
+    /// The caller publishes these; deciding what ratio is too low is the
+    /// reader's business, not the plugin's.
+    #[must_use]
+    pub fn hops(&self) -> (u64, u64) {
+        (self.hops_total, self.hops_enhanced)
     }
 
     /// Hand one analysis frame to the worker. Non-blocking; a full queue or an
     /// empty pool simply skips this frame, which the caller hears as one hop
     /// of unprocessed audio.
     pub fn submit(&mut self, spectrum: &[f32]) {
-        if self.failed.load(Ordering::Relaxed) || self.outstanding >= MAX_IN_FLIGHT {
+        self.hops_total += 1;
+        if self.expired_failure() || self.outstanding >= MAX_IN_FLIGHT {
             return;
         }
         let Some(mut frame) = self.pool.pop() else {
             return;
         };
         frame.copy_from_slice(spectrum);
-        if self.jobs.try_send(Job::Run(frame)).is_ok() {
+        if self.send(Job::Run(frame)) {
             self.outstanding += 1;
         }
     }
@@ -315,6 +388,7 @@ impl Inference {
         match self.done.try_recv() {
             Ok(frame) if self.outstanding > 0 => {
                 self.outstanding -= 1;
+                self.hops_enhanced += 1;
                 Some(frame)
             }
             // A frame nobody is waiting for: it was in the worker's hands when
@@ -338,17 +412,41 @@ impl Inference {
         self.pool.push(frame);
     }
 
-    /// True once the engine has failed to build and no further attempt will
-    /// be made.
+    /// True while the engine is known unbuildable. Clears itself after
+    /// [`RETRY_AFTER`] so one bad moment does not last the session.
     #[must_use]
     pub fn is_failed(&self) -> bool {
         self.failed.load(Ordering::Relaxed)
     }
 
+    /// Whether to skip this hop because the build failed recently. Lets the
+    /// latch go once it is older than [`RETRY_AFTER`].
+    fn expired_failure(&mut self) -> bool {
+        if !self.failed.load(Ordering::Relaxed) {
+            self.failed_since = None;
+            return false;
+        }
+        match self.failed_since {
+            None => {
+                self.failed_since = Some(Instant::now());
+                true
+            }
+            Some(since) if since.elapsed() >= RETRY_AFTER => {
+                self.failed.store(false, Ordering::Relaxed);
+                self.failed_since = None;
+                false
+            }
+            Some(_) => true,
+        }
+    }
+
     /// The node stopped: drop the engine and the recurrent state so an idle
     /// chain holds neither.
     pub fn reset(&mut self) {
-        let _ = self.jobs.try_send(Job::Reset);
+        self.send(Job::Reset);
+        self.hops_total = 0;
+        self.hops_enhanced = 0;
+        self.failed_since = None;
         // Whatever the worker already finished belongs to the stream that just
         // ended; handing it to the next one would start it with stale audio.
         while let Ok(frame) = self.done.try_recv() {
@@ -364,10 +462,22 @@ impl Default for Inference {
     }
 }
 
+impl Drop for Inference {
+    fn drop(&mut self) {
+        // Close the queue first, so the worker's `recv_timeout` returns at
+        // once instead of waiting out the linger. A worker already inside
+        // `build()` finishes it — bounded by the compile, and this runs on
+        // the host's teardown path, never on the data loop.
+        self.jobs = None;
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
 
     /// One callback at 1920/48000. Every audio-thread call must be orders of
     /// magnitude below this.

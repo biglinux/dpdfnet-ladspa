@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
-use dpdfnet_ladspa::{get_ladspa_descriptor, MIN_BLOCK_MS, MODEL_SAMPLE_RATE};
+use dpdfnet_ladspa::{get_ladspa_descriptor, MODEL_SAMPLE_RATE};
 use ladspa::{Data, PortConnection, PortData};
 
 /// Blocks a `PipeWire` graph realistically negotiates for this chain.
@@ -42,6 +42,7 @@ fn drive(quantum: usize) -> (Duration, Duration, usize, usize) {
     let controls: [Data; 1] = [100.0];
     let mut input = vec![0.0; quantum];
     let mut output = vec![0.0; quantum];
+    let (mut hops_total, mut hops_enhanced) = (0.0, 0.0);
 
     let deadline = Duration::from_secs_f32(quantum as f32 / rate as f32);
     let blocks = (SECONDS * rate as f32 / quantum as f32) as usize;
@@ -56,6 +57,7 @@ fn drive(quantum: usize) -> (Duration, Duration, usize, usize) {
             // The output slice is handed out once, so it moves through an
             // `Option` rather than being captured by a closure.
             let mut output_slot = Some(&mut output[..]);
+            let mut report_slots = [Some(&mut hops_total), Some(&mut hops_enhanced)];
             let mut connections: Vec<PortConnection> = Vec::with_capacity(ports.len());
             for (i, port) in ports.iter().enumerate() {
                 let data = match i {
@@ -63,7 +65,12 @@ fn drive(quantum: usize) -> (Duration, Duration, usize, usize) {
                     1 => PortData::AudioOutput(RefCell::new(
                         output_slot.take().expect("one output port"),
                     )),
-                    _ => PortData::ControlInput(&controls[i - 2]),
+                    2 => PortData::ControlInput(&controls[0]),
+                    // The reporting ports. Each cell is handed out once, the
+                    // same way the output slice is.
+                    _ => PortData::ControlOutput(RefCell::new(
+                        report_slots[i - 3].take().expect("one cell per port"),
+                    )),
                 };
                 connections.push(PortConnection { port: *port, data });
             }
@@ -109,19 +116,17 @@ fn the_first_callback_never_stalls_and_the_shipped_block_never_overruns() {
             "the first callback took {first:?} of a {deadline:?} budget at {ms} ms"
         );
 
-        // Smaller blocks are reported for comparison. The promise starts at
-        // the model's measured minimum; `None` means the model has no live
-        // block at all and this bench makes no claim about it.
+        // Every model, every block. With inference off the audio thread the
+        // callback no longer does anything model-dependent, so there is no
+        // model this promise excludes.
         //
         // One overrun in a hundred is a scheduler hiccup on a shared build
         // machine, not a DSP regression. A budget rather than zero keeps the
         // gate meaningful instead of flaky — a real regression moves the
         // whole distribution, not one sample.
-        if MIN_BLOCK_MS.is_some_and(|min| ms as u32 >= min) {
-            assert!(
-                over * 100 <= blocks,
-                "{over} of {blocks} callbacks exceeded {deadline:?} at {ms} ms; worst {worst:?}"
-            );
-        }
+        assert!(
+            over * 100 <= blocks,
+            "{over} of {blocks} callbacks exceeded {deadline:?} at {ms} ms; worst {worst:?}"
+        );
     }
 }

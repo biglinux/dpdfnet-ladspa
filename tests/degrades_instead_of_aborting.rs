@@ -21,6 +21,7 @@ fn drive(rate: u64, blocks: usize) -> Vec<Data> {
     let controls: [Data; 1] = [100.0];
     let mut input = vec![0.0; QUANTUM];
     let mut output = vec![0.0; QUANTUM];
+    let (mut hops_total, mut hops_enhanced) = (0.0, 0.0);
     let mut collected = Vec::with_capacity(blocks * QUANTUM);
 
     for block in 0..blocks {
@@ -33,6 +34,7 @@ fn drive(rate: u64, blocks: usize) -> Vec<Data> {
             // The connections borrow `output`, so they have to go out of
             // scope before the block is collected.
             let mut output_slot = Some(&mut output[..]);
+            let mut report_slots = [Some(&mut hops_total), Some(&mut hops_enhanced)];
             let mut connections: Vec<PortConnection> = Vec::with_capacity(ports.len());
             for (i, port) in ports.iter().enumerate() {
                 let data = match i {
@@ -40,7 +42,12 @@ fn drive(rate: u64, blocks: usize) -> Vec<Data> {
                     1 => PortData::AudioOutput(RefCell::new(
                         output_slot.take().expect("one output port"),
                     )),
-                    _ => PortData::ControlInput(&controls[i - 2]),
+                    2 => PortData::ControlInput(&controls[0]),
+                    // The reporting ports. Each cell is handed out once, the
+                    // same way the output slice is.
+                    _ => PortData::ControlOutput(RefCell::new(
+                        report_slots[i - 3].take().expect("one cell per port"),
+                    )),
                 };
                 connections.push(PortConnection { port: *port, data });
             }
