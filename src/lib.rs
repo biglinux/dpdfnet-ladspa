@@ -188,21 +188,23 @@ impl DpdfnetPlugin {
             self.spec_in[k * 2 + 1] = c.im;
         }
 
-        // Hand this frame to the worker and read back the one submitted a
-        // hop ago. When nothing is ready — the engine is still compiling, the
-        // inference ran long, or the runtime is unusable — the delayed dry
-        // spectrum takes its place. It is the same instant in time as the
-        // enhanced frame would have been, so the output never jumps, and the
-        // synthesis rings advance either way.
-        if self.rate_ok {
-            self.inference.submit(&self.spec_in);
-        }
+        // Collect first, then hand over: the worker needs a whole hop to
+        // answer, so asking before submitting is what keeps the handoff one
+        // frame deep instead of alternating between full and empty.
+        //
+        // What comes back is the previous hop's frame. When nothing is ready
+        // — still compiling, inference ran long, runtime unusable — the
+        // previous hop's dry spectrum takes its place. Same instant either
+        // way, so the output never jumps, and the synthesis rings advance.
         match self.inference.take() {
             Some(frame) => {
                 self.spec_out.copy_from_slice(&frame);
                 self.inference.recycle(frame);
             }
             None => self.spec_out.copy_from_slice(&self.dry_delay),
+        }
+        if self.rate_ok {
+            self.inference.submit(&self.spec_in);
         }
         // The noisy reference for the blend below has to be the frame the
         // enhanced spectrum came from, not the one just captured.

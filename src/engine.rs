@@ -189,9 +189,18 @@ fn build() -> Option<Engine> {
 /// 10 ms, which the filter chain must declare to the graph.
 pub const ADDED_LATENCY_HOPS: usize = 1;
 
-/// Spectra in circulation. Two are in flight at the deepest point (one being
-/// inferred, one waiting to be collected) and the rest keep the audio thread
-/// from ever finding the pool empty, which would cost a frame.
+/// Frames the worker may hold at once.
+///
+/// Exactly one. The caller reads back the frame it submitted one hop ago, so
+/// any deeper queue is latency it does not know it has: with an unbounded
+/// pool the engine build alone parks four frames, the queue never drains
+/// again, and every enhanced frame is then blended against a noisy reference
+/// three hops newer than itself. Measured before this cap: 3.00 hops of lag
+/// where the code claimed 1.
+const MAX_IN_FLIGHT: usize = 1;
+
+/// Spectra in circulation: one with the worker, one being read, spares so the
+/// audio thread never finds the pool empty.
 const POOL: usize = 4;
 
 /// A spectrum buffer travelling between the two threads. Buffers are recycled
@@ -214,6 +223,9 @@ pub struct Inference {
     done: Receiver<Frame>,
     /// Buffers not currently in flight.
     pool: Vec<Frame>,
+    /// Frames handed over and not yet collected. Never above
+    /// [`MAX_IN_FLIGHT`], which is what keeps the handoff one hop deep.
+    outstanding: usize,
     /// The engine could not be built. Submitting again would re-run a
     /// 170 ms compile on the worker forever.
     failed: Arc<AtomicBool>,
@@ -230,6 +242,9 @@ impl Inference {
         thread::spawn(move || {
             let mut engine: Option<Engine> = None;
             let mut state = crate::build_init_state();
+            // Allocated once; the worker is not the audio thread but a
+            // per-frame allocation is still pointless.
+            let mut scratch: Vec<f32> = Vec::new();
             for job in job_rx {
                 match job {
                     Job::Reset => {
@@ -247,16 +262,18 @@ impl Inference {
                         // caller treats exactly like a late result: dry audio,
                         // time-aligned, rings still advancing.
                         if let Some(engine) = engine.as_mut() {
-                            let mut enhanced = vec![0.0_f32; frame.len()];
-                            if engine.run(&frame, &mut state, &mut enhanced) {
-                                frame.copy_from_slice(&enhanced);
+                            if scratch.len() != frame.len() {
+                                scratch = vec![0.0_f32; frame.len()];
+                            }
+                            if engine.run(&frame, &mut state, &mut scratch) {
+                                frame.copy_from_slice(&scratch);
                             }
                         }
-                        if done_tx.try_send(frame).is_err() {
-                            // The caller stopped collecting; its pool refills
-                            // from the buffers it still holds.
-                            return;
-                        }
+                        // `done` holds POOL slots and at most MAX_IN_FLIGHT
+                        // frames are ever in play, so this cannot block; drop
+                        // the frame rather than the worker if that ever stops
+                        // being true.
+                        let _ = done_tx.try_send(frame);
                     }
                 }
             }
@@ -268,6 +285,7 @@ impl Inference {
             pool: (0..POOL)
                 .map(|_| vec![0.0_f32; model_const::FREQ_BINS * 2].into_boxed_slice())
                 .collect(),
+            outstanding: 0,
             failed,
         }
     }
@@ -276,14 +294,16 @@ impl Inference {
     /// empty pool simply skips this frame, which the caller hears as one hop
     /// of unprocessed audio.
     pub fn submit(&mut self, spectrum: &[f32]) {
-        if self.failed.load(Ordering::Relaxed) {
+        if self.failed.load(Ordering::Relaxed) || self.outstanding >= MAX_IN_FLIGHT {
             return;
         }
         let Some(mut frame) = self.pool.pop() else {
             return;
         };
         frame.copy_from_slice(spectrum);
-        let _ = self.jobs.try_send(Job::Run(frame));
+        if self.jobs.try_send(Job::Run(frame)).is_ok() {
+            self.outstanding += 1;
+        }
     }
 
     /// The enhanced spectrum for an earlier frame, if the worker is done with
@@ -292,7 +312,25 @@ impl Inference {
     ///
     /// Call [`recycle`](Self::recycle) with the frame once it has been read.
     pub fn take(&mut self) -> Option<Frame> {
-        self.done.try_recv().ok()
+        match self.done.try_recv() {
+            Ok(frame) if self.outstanding > 0 => {
+                self.outstanding -= 1;
+                Some(frame)
+            }
+            // A frame nobody is waiting for: it was in the worker's hands when
+            // the node reset, so it belongs to the previous stream.
+            Ok(frame) => {
+                self.pool.push(frame);
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // The worker is gone. Without this the plugin would emit dry
+                // audio forever with `is_failed()` still reporting false.
+                self.failed.store(true, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     /// Return a collected buffer to the pool.
@@ -311,6 +349,12 @@ impl Inference {
     /// chain holds neither.
     pub fn reset(&mut self) {
         let _ = self.jobs.try_send(Job::Reset);
+        // Whatever the worker already finished belongs to the stream that just
+        // ended; handing it to the next one would start it with stale audio.
+        while let Ok(frame) = self.done.try_recv() {
+            self.pool.push(frame);
+        }
+        self.outstanding = 0;
     }
 }
 
@@ -350,8 +394,8 @@ mod tests {
         let mut enhanced = 0;
         for hop in 0..warmup + hops {
             let start = Instant::now();
-            inference.submit(&spec);
             let got = inference.take();
+            inference.submit(&spec);
             let elapsed = start.elapsed();
             if let Some(frame) = got {
                 if hop >= warmup {
@@ -367,6 +411,57 @@ mod tests {
             }
         }
         (worst, enhanced)
+    }
+
+    /// The handoff must stay exactly one hop deep, through the engine build
+    /// and through a reset. Nothing enforced this before: the build parked
+    /// four frames, the queue never drained, and every enhanced frame was
+    /// afterwards blended against a noisy reference three hops newer than
+    /// itself. Measured lag was 3.00 hops while the code advertised 1.
+    #[test]
+    fn the_handoff_never_runs_deeper_than_one_hop() {
+        let mut inference = Inference::new();
+        let spec = spectrum(0.0);
+        let mut worst = 0_usize;
+
+        let hop = |inference: &mut Inference| {
+            let start = Instant::now();
+            if let Some(frame) = inference.take() {
+                inference.recycle(frame);
+            }
+            inference.submit(&spec);
+            if let Some(idle) = hop_period().checked_sub(start.elapsed()) {
+                thread::sleep(idle);
+            }
+        };
+
+        // Across the build, which is where the queue used to fill up.
+        for _ in 0..300 {
+            hop(&mut inference);
+            worst = worst.max(inference.outstanding);
+        }
+        assert!(
+            worst <= MAX_IN_FLIGHT,
+            "{worst} frames in flight during the build, cap is {MAX_IN_FLIGHT}"
+        );
+
+        // And across a reset, which used to leave the previous stream's
+        // finished frames waiting for the next one.
+        inference.reset();
+        assert_eq!(inference.outstanding, 0, "reset must clear the handoff");
+        assert_eq!(
+            inference.pool.len(),
+            POOL,
+            "reset must return every buffer to the pool"
+        );
+        for _ in 0..300 {
+            hop(&mut inference);
+            worst = worst.max(inference.outstanding);
+        }
+        assert!(
+            worst <= MAX_IN_FLIGHT,
+            "{worst} frames in flight after reset"
+        );
     }
 
     #[test]
@@ -392,8 +487,9 @@ mod tests {
 
         for hop in 0..300 {
             let start = Instant::now();
+            let got = inference.take();
             inference.submit(&spec);
-            if let Some(frame) = inference.take() {
+            if let Some(frame) = got {
                 // The first hops are the engine build; only judge after it.
                 if hop >= 100 {
                     returned += 1;

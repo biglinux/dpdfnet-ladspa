@@ -19,11 +19,12 @@ pkgver=$(date +%y.%m.%d)
 pkgrel=$(date +%H%M)
 arch=('x86_64')
 url='https://github.com/ceva-ip/DPDFNet'
-# Upstream (ceva-ip/DPDFNet) ships LICENSE as Apache-2.0 — both the
-# source code and the published ONNX weights on HF are covered.
+# The shipped .so is our MIT plugin code with upstream's Apache-2.0 model
+# embedded in it, so both apply. Upstream (ceva-ip/DPDFNet) ships LICENSE as
+# Apache-2.0 covering both its source and the published ONNX weights on HF.
 # Citation: Rika, Sapir, Gus (2025) "DPDFNet: Boosting DeepFilterNet2
 # via Dual-Path RNN".
-license=('Apache-2.0')
+license=('MIT' 'Apache-2.0')
 makedepends=(
 	'cargo'
 	'rust'
@@ -53,7 +54,9 @@ _split_depends=('gcc-libs' 'glibc' 'openvino')
 # Pinned to a commit, not to `main`: a branch makes the download
 # unreproducible and the checksums below meaningless. Bump both together,
 # taking the new sums from Hugging Face's `x-linked-etag` header, which is
-# the file's sha256 — no need to download to re-pin.
+# the file's sha256 — no need to download to re-pin. That header and the
+# download share an origin, so it is a convenience, not a second opinion;
+# the copies already in the build cache are what corroborated these.
 _hf_rev='dd6818d00f50c836fed43a6243ebe49116de5964'
 _hf_base="https://huggingface.co/Ceva-IP/DPDFNet/resolve/${_hf_rev}/onnx"
 
@@ -178,41 +181,35 @@ _install_model() {
 package_dpdfnet-ladspa-baseline() {
 	pkgdesc='DPDFNet 16 kHz baseline LADSPA plugin (fastest, 0-8 kHz band)'
 	depends=("${_split_depends[@]}")
-	provides=('ladspa-host')
 	_install_model baseline "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet2() {
 	pkgdesc='DPDFNet-2 16 kHz LADSPA plugin (balanced quality/speed, upstream default)'
 	depends=("${_split_depends[@]}")
-	provides=('ladspa-host')
 	_install_model dpdfnet2 "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet4() {
 	pkgdesc='DPDFNet-4 16 kHz LADSPA plugin (higher quality, deeper DPRNN stack)'
 	depends=("${_split_depends[@]}")
-	provides=('ladspa-host')
 	_install_model dpdfnet4 "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet8() {
 	pkgdesc='DPDFNet-8 16 kHz LADSPA plugin (highest quality 16 kHz variant)'
 	depends=("${_split_depends[@]}")
-	provides=('ladspa-host')
 	_install_model dpdfnet8 "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet2-48khz-hr() {
 	pkgdesc='DPDFNet-2 48 kHz hi-res LADSPA plugin (full-band, balanced)'
 	depends=("${_split_depends[@]}")
-	provides=('ladspa-host')
 	_install_model dpdfnet2_48khz_hr "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet8-48khz-hr() {
 	pkgdesc='DPDFNet-8 48 kHz hi-res LADSPA plugin (full-band, highest quality)'
 	depends=("${_split_depends[@]}")
-	provides=('ladspa-host')
 	_install_model dpdfnet8_48khz_hr "${pkgname}"
 }
