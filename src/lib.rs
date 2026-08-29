@@ -161,6 +161,10 @@ struct DpdfnetPlugin {
     submitted: VecDeque<u64>,
     /// Buffers retired from the delay line, waiting to carry the next hop.
     dry_spares: Vec<Vec<f32>>,
+    /// The noisy spectrum of the hop currently being emitted, kept for the
+    /// attenuation blend. Not the same hop as `spec_in`, which is `depth`
+    /// ahead of it.
+    blend_ref: Vec<f32>,
     /// Hops seen since this stream started.
     hop: u64,
     /// How far behind the worker is allowed to run: the hops one callback
@@ -230,6 +234,7 @@ impl DpdfnetPlugin {
             dry_spares: (0..MAX_DEPTH + 2)
                 .map(|_| vec![0.0; model_const::FREQ_BINS * 2])
                 .collect(),
+            blend_ref: vec![0.0; model_const::FREQ_BINS * 2],
             hop: 0,
             depth: 1,
             rate_ok,
@@ -311,7 +316,7 @@ impl DpdfnetPlugin {
         // alpha = 0 → fully enhanced; alpha = 1 → passthrough.
         if alpha > 0.0 {
             for k in 0..model_const::FREQ_BINS * 2 {
-                self.spec_out[k] = alpha * self.spec_in[k] + (1.0 - alpha) * self.spec_out[k];
+                self.spec_out[k] = alpha * self.blend_ref[k] + (1.0 - alpha) * self.spec_out[k];
             }
         }
 
@@ -377,9 +382,16 @@ impl DpdfnetPlugin {
             let Some((_, buf)) = self.dry_delay.pop_front() else {
                 break;
             };
-            if hop == due && !answered {
-                self.spec_out.copy_from_slice(&buf);
-                answered = true;
+            if hop == due {
+                // The noisy spectrum of the hop being emitted. The blend below
+                // needs this and not the hop just captured: they are `depth`
+                // hops apart, 40 ms at the shipped block, and summing two
+                // different instants combs the spectrum instead of blending it.
+                self.blend_ref.copy_from_slice(&buf);
+                if !answered {
+                    self.spec_out.copy_from_slice(&buf);
+                    answered = true;
+                }
             }
             self.dry_spares.push(buf);
         }
