@@ -406,6 +406,26 @@ impl Inference {
         }
     }
 
+    /// Wait up to `timeout` for the next answer.
+    ///
+    /// Only for hosts with no deadline. An offline converter runs far faster
+    /// than real time, so the worker never gets a gap to answer in and every
+    /// hop would come back raw — measured 0 of 698 hops enhanced flat out
+    /// against 665 of 698 paced. There the right thing is to wait; on the
+    /// audio thread it never is.
+    pub fn take_waiting(&mut self, timeout: Duration) -> Option<Frame> {
+        if self.outstanding == 0 {
+            return None;
+        }
+        match self.done.recv_timeout(timeout) {
+            Ok(frame) => {
+                self.outstanding -= 1;
+                Some(frame)
+            }
+            Err(_) => None,
+        }
+    }
+
     /// Return a collected buffer to the pool.
     pub fn recycle(&mut self, frame: Frame) {
         self.pool.push(frame);

@@ -29,6 +29,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ladspa::{
     DefaultValue, Plugin, PluginDescriptor, Port, PortConnection, PortDescriptor, Properties,
@@ -124,6 +125,15 @@ pub const MODEL_SAMPLE_RATE: usize = model_const::SAMPLE_RATE;
 /// which is why the growth path stays.
 const MAX_HOST_BLOCK: usize = 8192;
 
+/// How long an offline callback may wait for the worker. Generous, because
+/// there is no deadline; bounded, so a wedged worker cannot hang a converter.
+const OFFLINE_WAIT: Duration = Duration::from_millis(500);
+
+/// Audio to observe before judging whether the host has a deadline. Long
+/// enough that the engine build is not mistaken for a slow host, short enough
+/// that a converted file loses only its first fifth of a second.
+const OFFLINE_WARMUP_S: f64 = 0.2;
+
 const PORT_INPUT: usize = 0;
 const PORT_OUTPUT: usize = 1;
 const PORT_ATTEN_LIMIT_DB: usize = 2;
@@ -170,6 +180,14 @@ struct DpdfnetPlugin {
     /// How far behind the worker is allowed to run: the hops one callback
     /// carries. Recomputed whenever the host changes the block size.
     depth: usize,
+    /// True once the host has been seen feeding audio faster than real time,
+    /// which means it is a file converter and has no deadline to miss. Then
+    /// the callback may wait for the worker instead of emitting raw audio.
+    offline: bool,
+    /// Audio handed over since the first callback, in seconds.
+    audio_seen: f64,
+    /// When the first callback ran, for that comparison.
+    last_run: Option<Instant>,
     /// False when the host runs at a rate this model cannot serve. The
     /// engine is then never asked for and audio passes through.
     rate_ok: bool,
@@ -237,6 +255,9 @@ impl DpdfnetPlugin {
             blend_ref: vec![0.0; model_const::FREQ_BINS * 2],
             hop: 0,
             depth: 1,
+            offline: false,
+            audio_seen: 0.0,
+            last_run: None,
             rate_ok,
             failure_logged: false,
             // Pre-fill the analysis buffer with WIN_LEN zeros so the
@@ -295,8 +316,16 @@ impl DpdfnetPlugin {
         // worker has had a whole callback of wall clock to answer it, which
         // is the only interval it gets, since one callback carries several
         // hops with no time between them.
-        let due = hop.saturating_sub(self.depth as u64);
-        self.emit_hop(due);
+        // Nothing is due until the delay line has filled. Saturating this to
+        // zero instead made the first `depth` hops all claim hop 0, and each
+        // one popped a different entry off `submitted` — after which the tag
+        // the collector expected never matched a tag the worker sent again,
+        // for the rest of the stream.
+        let due = hop.checked_sub(self.depth as u64);
+        match due {
+            Some(due) => self.emit_hop(due, self.offline),
+            None => self.spec_out.fill(0.0),
+        }
 
         // Then remember this hop's noisy spectrum and hand it over.
         self.stash_dry(hop);
@@ -357,10 +386,29 @@ impl DpdfnetPlugin {
     /// discarding whatever is older than the hop being emitted. That only
     /// happens when the worker falls behind, and its late answer is out of
     /// time by then — one raw hop beats an output that jumps.
-    fn emit_hop(&mut self, due: u64) {
+    fn emit_hop(&mut self, due: u64, may_wait: bool) {
         let mut answered = false;
-        while let Some(frame) = self.inference.take() {
-            let matched = self.submitted.pop_front() == Some(due);
+
+        // Answers come back in submission order, so the front of `submitted`
+        // names the next frame the worker will hand over. Comparing that tag
+        // against `due` before collecting is what keeps the two streams in
+        // step: hops the worker refused are simply absent from this queue, so
+        // `due` is not `hop - depth` of anything it holds, and a collector
+        // that popped unconditionally consumed the wrong tag and never lined
+        // up again — measured as every later hop coming back raw.
+        while let Some(&next) = self.submitted.front() {
+            if next > due {
+                break;
+            }
+            let Some(frame) = (if may_wait {
+                self.inference.take_waiting(OFFLINE_WAIT)
+            } else {
+                self.inference.take()
+            }) else {
+                break;
+            };
+            self.submitted.pop_front();
+            let matched = next == due;
             if matched {
                 self.spec_out.copy_from_slice(&frame);
                 answered = true;
@@ -451,6 +499,25 @@ impl Plugin for DpdfnetPlugin {
         // worker has to be allowed to run. Pinning it at one let only the
         // first hop of each callback come back enhanced: measured 24 % at a
         // 1920-sample quantum, 48 % at 960, 90 % at 480.
+        // A host that has handed over far more audio than time has passed is
+        // reading a file, not a microphone. Compared cumulatively and latched
+        // once true: the moment the callback starts waiting for the worker the
+        // two rates converge, so a test that keeps re-deciding would switch
+        // itself back off and sit at a few per cent enhanced.
+        let now = Instant::now();
+        let started = *self.last_run.get_or_insert(now);
+        self.audio_seen += n as f64 / model_const::SAMPLE_RATE as f64;
+        if !self.offline && self.audio_seen > OFFLINE_WARMUP_S {
+            let elapsed = now.duration_since(started).as_secs_f64();
+            self.offline = self.audio_seen > elapsed * 4.0;
+            if std::env::var_os("DPDFNET_PROBE").is_some() {
+                eprintln!(
+                    "PROBE audio={:.3} elapsed={:.3} offline={}",
+                    self.audio_seen, elapsed, self.offline
+                );
+            }
+        }
+
         let hops_per_callback = n.div_ceil(model_const::HOP_SIZE).max(1);
         if hops_per_callback != self.depth {
             self.depth = hops_per_callback;
@@ -460,6 +527,25 @@ impl Plugin for DpdfnetPlugin {
         // One callback carries this many analysis hops, back to back with no
         // wall clock between them, so that is exactly how far behind the
         // worker has to be allowed to run.
+        // A host that has handed over far more audio than time has passed is
+        // reading a file, not a microphone. Compared cumulatively and latched
+        // once true: the moment the callback starts waiting for the worker the
+        // two rates converge, so a test that keeps re-deciding would switch
+        // itself back off and sit at a few per cent enhanced.
+        let now = Instant::now();
+        let started = *self.last_run.get_or_insert(now);
+        self.audio_seen += n as f64 / model_const::SAMPLE_RATE as f64;
+        if !self.offline && self.audio_seen > OFFLINE_WARMUP_S {
+            let elapsed = now.duration_since(started).as_secs_f64();
+            self.offline = self.audio_seen > elapsed * 4.0;
+            if std::env::var_os("DPDFNET_PROBE").is_some() {
+                eprintln!(
+                    "PROBE audio={:.3} elapsed={:.3} offline={}",
+                    self.audio_seen, elapsed, self.offline
+                );
+            }
+        }
+
         let hops_per_callback = n.div_ceil(model_const::HOP_SIZE).max(1);
         if hops_per_callback != self.depth {
             self.depth = hops_per_callback;
