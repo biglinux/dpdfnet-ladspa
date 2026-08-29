@@ -42,7 +42,6 @@ fn drive(quantum: usize) -> (Duration, Duration, usize, usize) {
     let controls: [Data; 1] = [100.0];
     let mut input = vec![0.0; quantum];
     let mut output = vec![0.0; quantum];
-    let (mut hops_total, mut hops_enhanced) = (0.0, 0.0);
 
     let deadline = Duration::from_secs_f32(quantum as f32 / rate as f32);
     let blocks = (SECONDS * rate as f32 / quantum as f32) as usize;
@@ -57,7 +56,6 @@ fn drive(quantum: usize) -> (Duration, Duration, usize, usize) {
             // The output slice is handed out once, so it moves through an
             // `Option` rather than being captured by a closure.
             let mut output_slot = Some(&mut output[..]);
-            let mut report_slots = [Some(&mut hops_total), Some(&mut hops_enhanced)];
             let mut connections: Vec<PortConnection> = Vec::with_capacity(ports.len());
             for (i, port) in ports.iter().enumerate() {
                 let data = match i {
@@ -65,12 +63,7 @@ fn drive(quantum: usize) -> (Duration, Duration, usize, usize) {
                     1 => PortData::AudioOutput(RefCell::new(
                         output_slot.take().expect("one output port"),
                     )),
-                    2 => PortData::ControlInput(&controls[0]),
-                    // The reporting ports. Each cell is handed out once, the
-                    // same way the output slice is.
-                    _ => PortData::ControlOutput(RefCell::new(
-                        report_slots[i - 3].take().expect("one cell per port"),
-                    )),
+                    _ => PortData::ControlInput(&controls[0]),
                 };
                 connections.push(PortConnection { port: *port, data });
             }

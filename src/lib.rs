@@ -27,6 +27,7 @@
 //! Intel hybrid silicon we ship to.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ladspa::{
@@ -47,6 +48,48 @@ mod model_const {
     // also suppressed here.
     #![allow(dead_code, clippy::unreadable_literal)]
     include!(concat!(env!("OUT_DIR"), "/model_const.rs"));
+}
+
+/// Hops the plugin asked the worker for, and how many came back enhanced.
+///
+/// Process-global, because the reader is `bigaudioimprove-pwloader` and the
+/// plugin runs *inside* it: same address space, so a number crosses between
+/// them for the price of an atomic store. Two relaxed stores per hop is the
+/// whole audio-thread cost.
+///
+/// The first design published these on LADSPA control output ports. That is
+/// correct LADSPA and useless here: `module-filter-chain` surfaces control
+/// inputs as node properties and keeps outputs inside the graph, so nothing
+/// outside could ever read them. Verified against the running chain, which
+/// lists `ai:Attenuation Limit (dB)` and neither output.
+///
+/// Global and monotonic on purpose. The reader asks whether *this service* is
+/// keeping up, so several instances summing is the right arithmetic, and a
+/// counter that only ever rises means the reader can difference two samples
+/// without caring what reset in between.
+static HOPS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HOPS_ENHANCED: AtomicU64 = AtomicU64::new(0);
+
+/// Read the counters above.
+///
+/// Exported with the C ABI so the loader can `dlsym` it out of the same
+/// `.so` the filter chain already loaded — the second `dlopen` of a path
+/// returns the same link map, hence the same statics the audio thread is
+/// writing.
+///
+/// # Safety
+///
+/// Both pointers must be non-null and aligned; nothing is retained.
+#[no_mangle]
+pub unsafe extern "C" fn dpdfnet_hops(total: *mut u64, enhanced: *mut u64) {
+    if total.is_null() || enhanced.is_null() {
+        return;
+    }
+    // SAFETY: the caller guarantees both pointers are valid for one write.
+    unsafe {
+        *total = HOPS_TOTAL.load(Ordering::Relaxed);
+        *enhanced = HOPS_ENHANCED.load(Ordering::Relaxed);
+    }
 }
 
 /// Samples of latency this plugin adds, for the host to declare to its graph.
@@ -76,10 +119,6 @@ const MAX_HOST_BLOCK: usize = 8192;
 const PORT_INPUT: usize = 0;
 const PORT_OUTPUT: usize = 1;
 const PORT_ATTEN_LIMIT_DB: usize = 2;
-/// Hops the plugin asked the worker for since this stream started.
-const PORT_HOPS_TOTAL: usize = 3;
-/// Of those, how many came back enhanced. The rest were the dry fallback.
-const PORT_HOPS_ENHANCED: usize = 4;
 
 fn build_init_state() -> Vec<f32> {
     assert_eq!(model_const::INIT_STATE.len(), model_const::STATE_SIZE * 4);
@@ -219,8 +258,10 @@ impl DpdfnetPlugin {
         // — still compiling, inference ran long, runtime unusable — the
         // previous hop's dry spectrum takes its place. Same instant either
         // way, so the output never jumps, and the synthesis rings advance.
+        HOPS_TOTAL.fetch_add(1, Ordering::Relaxed);
         match self.inference.take() {
             Some(frame) => {
+                HOPS_ENHANCED.fetch_add(1, Ordering::Relaxed);
                 self.spec_out.copy_from_slice(&frame);
                 self.inference.recycle(frame);
             }
@@ -321,10 +362,6 @@ impl Plugin for DpdfnetPlugin {
         for slot in output.iter_mut().take(n) {
             *slot = self.out_queue.pop_front().unwrap_or(0.0);
         }
-
-        let (total, enhanced) = self.inference.hops();
-        **ports[PORT_HOPS_TOTAL].unwrap_control_mut() = total as f32;
-        **ports[PORT_HOPS_ENHANCED].unwrap_control_mut() = enhanced as f32;
     }
 }
 
@@ -368,20 +405,6 @@ pub extern "C" fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> 
                 lower_bound: Some(0.0),
                 upper_bound: Some(100.0),
             },
-            // With inference off the audio thread, a worker that cannot keep
-            // up is invisible in xruns: the callback always finishes and the
-            // user hears the dry fallback. These two say how often that
-            // happened. The plugin reports; whoever reads decides what is bad.
-            Port {
-                name: "Hops Total",
-                desc: PortDescriptor::ControlOutput,
-                ..Default::default()
-            },
-            Port {
-                name: "Hops Enhanced",
-                desc: PortDescriptor::ControlOutput,
-                ..Default::default()
-            },
         ],
         new: |_, sample_rate| Box::new(DpdfnetPlugin::new(sample_rate)),
     })
@@ -412,7 +435,6 @@ mod tests {
         let controls = [100.0_f32];
         let input = vec![0.1_f32; quantum];
         let mut output = vec![0.0_f32; quantum];
-        let (mut total, mut enhanced) = (0.0_f32, 0.0_f32);
 
         let reserved = (
             plugin.in_buf.capacity(),
@@ -423,7 +445,6 @@ mod tests {
         for call in 0..4 {
             {
                 let mut output_slot = Some(&mut output[..]);
-                let mut report_slots = [Some(&mut total), Some(&mut enhanced)];
                 let mut connections: Vec<PortConnection> = Vec::with_capacity(ports.len());
                 for (i, port) in ports.iter().enumerate() {
                     let data = match i {
@@ -431,10 +452,7 @@ mod tests {
                         1 => PortData::AudioOutput(RefCell::new(
                             output_slot.take().expect("one output port"),
                         )),
-                        2 => PortData::ControlInput(&controls[0]),
-                        _ => PortData::ControlOutput(RefCell::new(
-                            report_slots[i - 3].take().expect("one cell per port"),
-                        )),
+                        _ => PortData::ControlInput(&controls[0]),
                     };
                     connections.push(PortConnection { port: *port, data });
                 }

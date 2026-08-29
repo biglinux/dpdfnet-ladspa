@@ -253,12 +253,6 @@ pub struct Inference {
     /// during an upgrade, a moment without memory — heals itself instead of
     /// leaving the microphone dry until the process restarts.
     failed_since: Option<Instant>,
-    /// Hops asked for since the last reset, and how many came back enhanced.
-    /// Published on control ports: with the work off the audio thread, a
-    /// worker that cannot keep up shows up here and nowhere else — xruns stay
-    /// at zero while the user hears the dry fallback.
-    hops_total: u64,
-    hops_enhanced: u64,
 }
 
 /// How long a failed build is trusted to stay failed.
@@ -335,8 +329,6 @@ impl Inference {
             outstanding: 0,
             failed,
             failed_since: None,
-            hops_total: 0,
-            hops_enhanced: 0,
         }
     }
 
@@ -354,19 +346,10 @@ impl Inference {
         self.send(Job::Prime);
     }
 
-    /// Hops asked for and hops that came back enhanced, since the last reset.
-    /// The caller publishes these; deciding what ratio is too low is the
-    /// reader's business, not the plugin's.
-    #[must_use]
-    pub fn hops(&self) -> (u64, u64) {
-        (self.hops_total, self.hops_enhanced)
-    }
-
     /// Hand one analysis frame to the worker. Non-blocking; a full queue or an
     /// empty pool simply skips this frame, which the caller hears as one hop
     /// of unprocessed audio.
     pub fn submit(&mut self, spectrum: &[f32]) {
-        self.hops_total += 1;
         if self.expired_failure() || self.outstanding >= MAX_IN_FLIGHT {
             return;
         }
@@ -388,7 +371,6 @@ impl Inference {
         match self.done.try_recv() {
             Ok(frame) if self.outstanding > 0 => {
                 self.outstanding -= 1;
-                self.hops_enhanced += 1;
                 Some(frame)
             }
             // A frame nobody is waiting for: it was in the worker's hands when
@@ -444,8 +426,6 @@ impl Inference {
     /// chain holds neither.
     pub fn reset(&mut self) {
         self.send(Job::Reset);
-        self.hops_total = 0;
-        self.hops_enhanced = 0;
         self.failed_since = None;
         // Whatever the worker already finished belongs to the stream that just
         // ended; handing it to the next one would start it with stale audio.

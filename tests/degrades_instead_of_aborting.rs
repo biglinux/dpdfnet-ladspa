@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 
-use dpdfnet_ladspa::{get_ladspa_descriptor, MODEL_SAMPLE_RATE};
+use dpdfnet_ladspa::{dpdfnet_hops, get_ladspa_descriptor, MODEL_SAMPLE_RATE};
 use ladspa::{Data, PortConnection, PortData};
 
 const QUANTUM: usize = 512;
@@ -21,7 +21,6 @@ fn drive(rate: u64, blocks: usize) -> Vec<Data> {
     let controls: [Data; 1] = [100.0];
     let mut input = vec![0.0; QUANTUM];
     let mut output = vec![0.0; QUANTUM];
-    let (mut hops_total, mut hops_enhanced) = (0.0, 0.0);
     let mut collected = Vec::with_capacity(blocks * QUANTUM);
 
     for block in 0..blocks {
@@ -34,7 +33,6 @@ fn drive(rate: u64, blocks: usize) -> Vec<Data> {
             // The connections borrow `output`, so they have to go out of
             // scope before the block is collected.
             let mut output_slot = Some(&mut output[..]);
-            let mut report_slots = [Some(&mut hops_total), Some(&mut hops_enhanced)];
             let mut connections: Vec<PortConnection> = Vec::with_capacity(ports.len());
             for (i, port) in ports.iter().enumerate() {
                 let data = match i {
@@ -42,12 +40,7 @@ fn drive(rate: u64, blocks: usize) -> Vec<Data> {
                     1 => PortData::AudioOutput(RefCell::new(
                         output_slot.take().expect("one output port"),
                     )),
-                    2 => PortData::ControlInput(&controls[0]),
-                    // The reporting ports. Each cell is handed out once, the
-                    // same way the output slice is.
-                    _ => PortData::ControlOutput(RefCell::new(
-                        report_slots[i - 3].take().expect("one cell per port"),
-                    )),
+                    _ => PortData::ControlInput(&controls[0]),
                 };
                 connections.push(PortConnection { port: *port, data });
             }
@@ -91,4 +84,30 @@ fn reactivating_after_deactivate_keeps_working() {
     let second = drive(MODEL_SAMPLE_RATE as u64, 10);
     assert!(first.iter().all(|s| s.is_finite()));
     assert!(second.iter().all(|s| s.is_finite()));
+}
+
+/// The loader reads the counters by `dlsym`-ing this accessor out of the same
+/// `.so` the filter chain loaded. That only works if the exported function
+/// sees the statics the audio thread writes — same process, same link map.
+/// Here the linkage is direct, which is the same guarantee.
+#[test]
+fn the_exported_accessor_sees_what_the_audio_thread_counted() {
+    let (mut before_total, mut before_enhanced) = (0_u64, 0_u64);
+    // SAFETY: both pointers are valid for one write each.
+    unsafe { dpdfnet_hops(&raw mut before_total, &raw mut before_enhanced) };
+
+    drive(MODEL_SAMPLE_RATE as u64, 30);
+
+    let (mut total, mut enhanced) = (0_u64, 0_u64);
+    // SAFETY: as above.
+    unsafe { dpdfnet_hops(&raw mut total, &raw mut enhanced) };
+
+    assert!(
+        total > before_total,
+        "the accessor read {total} hops after driving 30 blocks"
+    );
+    assert!(
+        enhanced <= total,
+        "{enhanced} enhanced of {total} asked for"
+    );
 }
