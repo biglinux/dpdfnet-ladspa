@@ -37,8 +37,14 @@ use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 mod engine;
-use engine::Inference;
-pub use engine::ADDED_LATENCY_HOPS;
+
+use engine::{Inference, MAX_DEPTH};
+
+/// Hops one 40 ms callback carries — the block the BigLinux chain negotiates,
+/// and therefore the handoff depth the reported latency assumes. A graph that
+/// settles on a different block gets a different real latency; this is the one
+/// worth declaring.
+const SHIPPED_DEPTH_HOPS: usize = 40 * model_const::SAMPLE_RATE / 1000 / model_const::HOP_SIZE;
 
 mod model_const {
     // `MODEL_NAME` ships for diagnostics / log lines; the LADSPA hot
@@ -101,8 +107,10 @@ pub unsafe extern "C" fn dpdfnet_hops(total: *mut u64, enhanced: *mut u64) {
 /// `.so`. A caller that finds no such symbol is looking at an older plugin.
 #[no_mangle]
 pub extern "C" fn dpdfnet_added_latency_frames() -> u32 {
-    // The worker handoff, plus the analysis window the constructor primes.
-    (ADDED_LATENCY_HOPS * model_const::HOP_SIZE + model_const::WIN_LEN) as u32
+    // The handoff is as deep as the hops one callback carries, so the number
+    // depends on the block the graph settled on. Reported for the shipped
+    // 40 ms block; the analysis window the constructor primes is on top.
+    (SHIPPED_DEPTH_HOPS * model_const::HOP_SIZE + model_const::WIN_LEN) as u32
 }
 
 /// The host sample rate this build's model requires. A filter chain running
@@ -140,12 +148,24 @@ fn vorbis_window(win_len: usize) -> Vec<f32> {
 }
 
 struct DpdfnetPlugin {
-    /// Runs the model on a worker thread, one hop behind the audio.
+    /// Runs the model on a worker thread, `depth` hops behind the audio.
     inference: Inference,
-    /// The previous hop's noisy spectrum: what the enhanced frame currently
-    /// coming back was computed from. Doubles as the fallback when the
-    /// worker has nothing ready.
-    dry_delay: Vec<f32>,
+    /// The noisy spectrum of every hop still waiting for its answer, oldest
+    /// first, tagged with the hop it came from. The head is what the worker
+    /// owes us now: either the enhanced version arrives, or this is what goes
+    /// out instead — the same instant either way, so the output never jumps.
+    dry_delay: VecDeque<(u64, Vec<f32>)>,
+    /// Hops submitted and not yet collected, oldest first. The worker answers
+    /// in order, so this is how a returned frame is matched to its hop
+    /// without carrying a tag through the buffers.
+    submitted: VecDeque<u64>,
+    /// Buffers retired from the delay line, waiting to carry the next hop.
+    dry_spares: Vec<Vec<f32>>,
+    /// Hops seen since this stream started.
+    hop: u64,
+    /// How far behind the worker is allowed to run: the hops one callback
+    /// carries. Recomputed whenever the host changes the block size.
+    depth: usize,
     /// False when the host runs at a rate this model cannot serve. The
     /// engine is then never asked for and audio passes through.
     rate_ok: bool,
@@ -203,7 +223,15 @@ impl DpdfnetPlugin {
 
         Self {
             inference: Inference::new(),
-            dry_delay: vec![0.0; model_const::FREQ_BINS * 2],
+            // Sized for the deepest handoff so the audio thread never grows
+            // it; the entries themselves are reused, never reallocated.
+            dry_delay: VecDeque::with_capacity(MAX_DEPTH + 2),
+            submitted: VecDeque::with_capacity(MAX_DEPTH + 2),
+            dry_spares: (0..MAX_DEPTH + 2)
+                .map(|_| vec![0.0; model_const::FREQ_BINS * 2])
+                .collect(),
+            hop: 0,
+            depth: 1,
             rate_ok,
             failure_logged: false,
             // Pre-fill the analysis buffer with WIN_LEN zeros so the
@@ -250,29 +278,26 @@ impl DpdfnetPlugin {
             self.spec_in[k * 2 + 1] = c.im;
         }
 
-        // Collect first, then hand over: the worker needs a whole hop to
-        // answer, so asking before submitting is what keeps the handoff one
-        // frame deep instead of alternating between full and empty.
-        //
-        // What comes back is the previous hop's frame. When nothing is ready
-        // — still compiling, inference ran long, runtime unusable — the
-        // previous hop's dry spectrum takes its place. Same instant either
-        // way, so the output never jumps, and the synthesis rings advance.
         HOPS_TOTAL.fetch_add(1, Ordering::Relaxed);
-        match self.inference.take() {
-            Some(frame) => {
-                HOPS_ENHANCED.fetch_add(1, Ordering::Relaxed);
-                self.spec_out.copy_from_slice(&frame);
-                self.inference.recycle(frame);
-            }
-            None => self.spec_out.copy_from_slice(&self.dry_delay),
+        let hop = self.hop;
+        self.hop += 1;
+
+        // Collect before handing over. The queue is exactly `depth` deep, so
+        // a submit before the collect always finds it full and is refused —
+        // that mistake cost 76 % of the hops at a 1920-sample block.
+        //
+        // What goes out now is the hop from `depth` back: far enough that the
+        // worker has had a whole callback of wall clock to answer it, which
+        // is the only interval it gets, since one callback carries several
+        // hops with no time between them.
+        let due = hop.saturating_sub(self.depth as u64);
+        self.emit_hop(due);
+
+        // Then remember this hop's noisy spectrum and hand it over.
+        self.stash_dry(hop);
+        if self.rate_ok && self.inference.submit(&self.spec_in) {
+            self.submitted.push_back(hop);
         }
-        if self.rate_ok {
-            self.inference.submit(&self.spec_in);
-        }
-        // The noisy reference for the blend below has to be the frame the
-        // enhanced spectrum came from, not the one just captured.
-        std::mem::swap(&mut self.spec_in, &mut self.dry_delay);
         if self.inference.is_failed() && !self.failure_logged {
             self.failure_logged = true;
             // The step that failed is already on the journal, one line up.
@@ -319,6 +344,64 @@ impl DpdfnetPlugin {
         self.in_buf
             .truncate(self.in_buf.len() - model_const::HOP_SIZE);
     }
+
+    /// Fill `spec_out` with the answer for hop `due`: the enhanced spectrum if
+    /// the worker produced it, otherwise the noisy one from that same hop.
+    ///
+    /// Both queues run in submission order, so pairing is a matter of
+    /// discarding whatever is older than the hop being emitted. That only
+    /// happens when the worker falls behind, and its late answer is out of
+    /// time by then — one raw hop beats an output that jumps.
+    fn emit_hop(&mut self, due: u64) {
+        let mut answered = false;
+        while let Some(frame) = self.inference.take() {
+            let matched = self.submitted.pop_front() == Some(due);
+            if matched {
+                self.spec_out.copy_from_slice(&frame);
+                answered = true;
+            }
+            self.inference.recycle(frame);
+            if matched {
+                HOPS_ENHANCED.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+
+        // Retire every noisy frame up to and including `due`, keeping the
+        // buffers. The one tagged `due` is the fallback when nothing enhanced
+        // arrived; anything older is the worker running behind.
+        while let Some(&(hop, _)) = self.dry_delay.front() {
+            if hop > due {
+                break;
+            }
+            let Some((_, buf)) = self.dry_delay.pop_front() else {
+                break;
+            };
+            if hop == due && !answered {
+                self.spec_out.copy_from_slice(&buf);
+                answered = true;
+            }
+            self.dry_spares.push(buf);
+        }
+
+        // Nothing for this hop at all: the delay line is still filling, which
+        // lasts `depth` hops at the start of a stream. Silence, like the
+        // analysis priming the constructor does.
+        if !answered {
+            self.spec_out.fill(0.0);
+        }
+    }
+
+    /// Put this hop's noisy spectrum on the delay line, on a buffer that has
+    /// already been emitted rather than a fresh one.
+    fn stash_dry(&mut self, hop: u64) {
+        let mut slot = self
+            .dry_spares
+            .pop()
+            .unwrap_or_else(|| vec![0.0; model_const::FREQ_BINS * 2]);
+        slot.copy_from_slice(&self.spec_in);
+        self.dry_delay.push_back((hop, slot));
+    }
 }
 
 impl Plugin for DpdfnetPlugin {
@@ -350,6 +433,26 @@ impl Plugin for DpdfnetPlugin {
         };
 
         let n = sample_count.min(input.len()).min(output.len());
+
+        // One callback carries this many analysis hops, back to back with no
+        // wall clock between them, so that is exactly how far behind the
+        // worker has to be allowed to run. Pinning it at one let only the
+        // first hop of each callback come back enhanced: measured 24 % at a
+        // 1920-sample quantum, 48 % at 960, 90 % at 480.
+        let hops_per_callback = n.div_ceil(model_const::HOP_SIZE).max(1);
+        if hops_per_callback != self.depth {
+            self.depth = hops_per_callback;
+            self.inference.set_depth(hops_per_callback);
+        }
+
+        // One callback carries this many analysis hops, back to back with no
+        // wall clock between them, so that is exactly how far behind the
+        // worker has to be allowed to run.
+        let hops_per_callback = n.div_ceil(model_const::HOP_SIZE).max(1);
+        if hops_per_callback != self.depth {
+            self.depth = hops_per_callback;
+            self.inference.set_depth(hops_per_callback);
+        }
 
         self.in_buf.extend_from_slice(&input[..n]);
 

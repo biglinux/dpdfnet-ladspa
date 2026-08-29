@@ -18,7 +18,7 @@
 //! frame submitted one hop earlier. A late result is not an xrun: the caller
 //! emits the delayed dry spectrum for that hop instead, time-aligned, and the
 //! recurrent state stays with the worker so nothing desynchronizes. The price
-//! is [`ADDED_LATENCY_HOPS`] of extra latency, which the host must declare.
+//! is one callback of extra latency, which the host must declare.
 //!
 //! Nothing here panics. A machine without a usable OpenVINO runtime gets a
 //! plugin that passes audio through, not a `pwloader` process that aborts and
@@ -185,24 +185,21 @@ fn build() -> Option<Engine> {
     })
 }
 
-/// Hops of latency the worker handoff adds: one frame is in flight while the
-/// caller consumes the previous one. At 48 kHz with a 480-sample hop that is
-/// 10 ms, which the filter chain must declare to the graph.
-pub const ADDED_LATENCY_HOPS: usize = 1;
-
-/// Frames the worker may hold at once.
+/// Deepest handoff the caller may ask for.
 ///
-/// Exactly one. The caller reads back the frame it submitted one hop ago, so
-/// any deeper queue is latency it does not know it has: with an unbounded
-/// pool the engine build alone parks four frames, the queue never drains
-/// again, and every enhanced frame is then blended against a noisy reference
-/// three hops newer than itself. Measured before this cap: 3.00 hops of lag
-/// where the code claimed 1.
-const MAX_IN_FLIGHT: usize = 1;
+/// One callback carries `quantum / HOP_SIZE` analysis hops and the worker gets
+/// no wall clock between them, so the queue has to be that deep or the extra
+/// hops go out unprocessed. Measured with the queue pinned at one, driving
+/// `dpdfnet8_48khz_hr`: 90 % of hops enhanced at a 480-sample quantum, 48 % at
+/// 960, 24 % at 1920 — one per callback, exactly.
+///
+/// The ceiling is PipeWire's `default.clock.quantum-limit` of 8192 over the
+/// smallest hop we ship, 160 samples at 16 kHz, rounded up.
+pub const MAX_DEPTH: usize = 64;
 
-/// Spectra in circulation: one with the worker, one being read, spares so the
-/// audio thread never finds the pool empty.
-const POOL: usize = 4;
+/// Spectra in circulation: the deepest handoff, plus the one being read and a
+/// spare, so a submit never fails for want of a buffer.
+const POOL: usize = MAX_DEPTH + 2;
 
 /// A spectrum buffer travelling between the two threads. Buffers are recycled
 /// rather than allocated, so the audio thread never touches the allocator.
@@ -242,9 +239,11 @@ pub struct Inference {
     done: Receiver<Frame>,
     /// Buffers not currently in flight.
     pool: Vec<Frame>,
-    /// Frames handed over and not yet collected. Never above
-    /// [`MAX_IN_FLIGHT`], which is what keeps the handoff one hop deep.
+    /// Frames handed over and not yet collected, and the ceiling the caller
+    /// set for it. The ceiling is what keeps the handoff exactly as deep as
+    /// the caller's own delay line, so the two stay paired.
     outstanding: usize,
+    depth: usize,
     /// The engine could not be built. Submitting again would re-run a
     /// 170-460 ms compile on the worker every hop.
     failed: Arc<AtomicBool>,
@@ -309,10 +308,10 @@ impl Inference {
                                 frame.copy_from_slice(&scratch);
                             }
                         }
-                        // `done` holds POOL slots and at most MAX_IN_FLIGHT
-                        // frames are ever in play, so this cannot block; drop
-                        // the frame rather than the worker if that ever stops
-                        // being true.
+                        // `done` holds POOL slots and never more than the
+                        // caller's depth is in play, so this cannot block;
+                        // drop the frame rather than the worker if that ever
+                        // stops being true.
                         let _ = done_tx.try_send(frame);
                     }
                 }
@@ -327,6 +326,7 @@ impl Inference {
                 .map(|_| vec![0.0_f32; model_const::FREQ_BINS * 2].into_boxed_slice())
                 .collect(),
             outstanding: 0,
+            depth: 1,
             failed,
             failed_since: None,
         }
@@ -340,26 +340,43 @@ impl Inference {
             .is_some_and(|jobs| jobs.try_send(job).is_ok())
     }
 
+    /// How many frames the worker may hold at once.
+    ///
+    /// The caller sets this to the hops one of its callbacks carries, so a
+    /// frame submitted in one callback comes back in the next. Clamped to
+    /// [`MAX_DEPTH`], which the pool is sized for.
+    pub fn set_depth(&mut self, hops_per_callback: usize) {
+        self.depth = hops_per_callback.clamp(1, MAX_DEPTH);
+    }
+
     /// Ask the worker to compile now. Called from `activate()`, before any
     /// audio, so the build overlaps the graph starting rather than speech.
     pub fn prime(&mut self) {
         self.send(Job::Prime);
     }
 
-    /// Hand one analysis frame to the worker. Non-blocking; a full queue or an
-    /// empty pool simply skips this frame, which the caller hears as one hop
-    /// of unprocessed audio.
-    pub fn submit(&mut self, spectrum: &[f32]) {
-        if self.expired_failure() || self.outstanding >= MAX_IN_FLIGHT {
-            return;
+    /// Hand one analysis frame to the worker.
+    ///
+    /// Returns whether it was accepted. The caller pairs answers with hops by
+    /// position, so it must not record a hop the worker never received — a
+    /// refused submit that still got recorded shifts every later pairing and
+    /// nothing matches again.
+    ///
+    /// Non-blocking: a full queue, an empty pool or a recent build failure
+    /// simply skips this frame, which the caller hears as one raw hop.
+    pub fn submit(&mut self, spectrum: &[f32]) -> bool {
+        if self.expired_failure() || self.outstanding >= self.depth {
+            return false;
         }
         let Some(mut frame) = self.pool.pop() else {
-            return;
+            return false;
         };
         frame.copy_from_slice(spectrum);
         if self.send(Job::Run(frame)) {
             self.outstanding += 1;
+            return true;
         }
+        false
     }
 
     /// The enhanced spectrum for an earlier frame, if the worker is done with
@@ -503,14 +520,17 @@ mod tests {
         (worst, enhanced)
     }
 
-    /// The handoff must stay exactly one hop deep, through the engine build
-    /// and through a reset. Nothing enforced this before: the build parked
-    /// four frames, the queue never drained, and every enhanced frame was
-    /// afterwards blended against a noisy reference three hops newer than
+    /// The handoff must stay exactly as deep as the caller asked, through the
+    /// engine build and through a reset. Nothing bounded it before: the build
+    /// parked four frames, the queue never drained, and every enhanced frame
+    /// was afterwards blended against a noisy reference three hops newer than
     /// itself. Measured lag was 3.00 hops while the code advertised 1.
     #[test]
-    fn the_handoff_never_runs_deeper_than_one_hop() {
+    fn the_handoff_never_runs_deeper_than_asked() {
+        /// Four hops, the depth a 1920-sample callback needs at 48 kHz.
+        const DEPTH: usize = 4;
         let mut inference = Inference::new();
+        inference.set_depth(DEPTH);
         let spec = spectrum(0.0);
         let mut worst = 0_usize;
 
@@ -531,8 +551,8 @@ mod tests {
             worst = worst.max(inference.outstanding);
         }
         assert!(
-            worst <= MAX_IN_FLIGHT,
-            "{worst} frames in flight during the build, cap is {MAX_IN_FLIGHT}"
+            worst <= DEPTH,
+            "{worst} frames in flight during the build, cap is {DEPTH}"
         );
 
         // And across a reset, which used to leave the previous stream's
@@ -548,10 +568,7 @@ mod tests {
             hop(&mut inference);
             worst = worst.max(inference.outstanding);
         }
-        assert!(
-            worst <= MAX_IN_FLIGHT,
-            "{worst} frames in flight after reset"
-        );
+        assert!(worst <= DEPTH, "{worst} frames in flight after reset");
     }
 
     #[test]
