@@ -499,6 +499,7 @@ impl Plugin for DpdfnetPlugin {
         // worker has to be allowed to run. Pinning it at one let only the
         // first hop of each callback come back enhanced: measured 24 % at a
         // 1920-sample quantum, 48 % at 960, 90 % at 480.
+        //
         // A host that has handed over far more audio than time has passed is
         // reading a file, not a microphone. Compared cumulatively and latched
         // once true: the moment the callback starts waiting for the worker the
@@ -510,12 +511,6 @@ impl Plugin for DpdfnetPlugin {
         if !self.offline && self.audio_seen > OFFLINE_WARMUP_S {
             let elapsed = now.duration_since(started).as_secs_f64();
             self.offline = self.audio_seen > elapsed * 4.0;
-            if std::env::var_os("DPDFNET_PROBE").is_some() {
-                eprintln!(
-                    "PROBE audio={:.3} elapsed={:.3} offline={}",
-                    self.audio_seen, elapsed, self.offline
-                );
-            }
         }
 
         let hops_per_callback = n.div_ceil(model_const::HOP_SIZE).max(1);
@@ -523,35 +518,6 @@ impl Plugin for DpdfnetPlugin {
             self.depth = hops_per_callback;
             self.inference.set_depth(hops_per_callback);
         }
-
-        // One callback carries this many analysis hops, back to back with no
-        // wall clock between them, so that is exactly how far behind the
-        // worker has to be allowed to run.
-        // A host that has handed over far more audio than time has passed is
-        // reading a file, not a microphone. Compared cumulatively and latched
-        // once true: the moment the callback starts waiting for the worker the
-        // two rates converge, so a test that keeps re-deciding would switch
-        // itself back off and sit at a few per cent enhanced.
-        let now = Instant::now();
-        let started = *self.last_run.get_or_insert(now);
-        self.audio_seen += n as f64 / model_const::SAMPLE_RATE as f64;
-        if !self.offline && self.audio_seen > OFFLINE_WARMUP_S {
-            let elapsed = now.duration_since(started).as_secs_f64();
-            self.offline = self.audio_seen > elapsed * 4.0;
-            if std::env::var_os("DPDFNET_PROBE").is_some() {
-                eprintln!(
-                    "PROBE audio={:.3} elapsed={:.3} offline={}",
-                    self.audio_seen, elapsed, self.offline
-                );
-            }
-        }
-
-        let hops_per_callback = n.div_ceil(model_const::HOP_SIZE).max(1);
-        if hops_per_callback != self.depth {
-            self.depth = hops_per_callback;
-            self.inference.set_depth(hops_per_callback);
-        }
-
         self.in_buf.extend_from_slice(&input[..n]);
 
         while self.in_buf.len() >= model_const::WIN_LEN {
