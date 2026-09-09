@@ -14,6 +14,10 @@ pkgname=(
 	'dpdfnet-ladspa-dpdfnet8'
 	'dpdfnet-ladspa-dpdfnet2-48khz-hr'
 	'dpdfnet-ladspa-dpdfnet8-48khz-hr'
+	'dpdfnet-ladspa-baseline-sb'
+	'dpdfnet-ladspa-dpdfnet2-sb'
+	'dpdfnet-ladspa-dpdfnet4-sb'
+	'dpdfnet-ladspa-dpdfnet8-sb'
 )
 pkgver=$(date +%y.%m.%d)
 pkgrel=$(date +%H%M)
@@ -69,6 +73,17 @@ _models=(
 	'dpdfnet8'
 	'dpdfnet2_48khz_hr'
 	'dpdfnet8_48khz_hr'
+)
+
+# Split-band variants. They reuse the 16 kHz models' IR, so they need no ONNX
+# of their own and no prepare() step — only a build(), after the base models
+# above have populated `model/<name>/`. Kept out of `_models` because that
+# array is index-aligned with source=/sha256sums=.
+_split_band=(
+	'baseline_sb'
+	'dpdfnet2_sb'
+	'dpdfnet4_sb'
+	'dpdfnet8_sb'
 )
 
 source=(
@@ -136,7 +151,7 @@ build() {
 	# `cargo:rerun-if-env-changed=DPDFNET_MODEL`, but separate target
 	# trees make the per-model artifact location unambiguous for the
 	# package_*() install steps below).
-	for model in "${_models[@]}"; do
+	for model in "${_models[@]}" "${_split_band[@]}"; do
 		msg "Building libdpdfnet_${model}_ladspa.so"
 		DPDFNET_MODEL="${model}" \
 			CARGO_TARGET_DIR="target-${model}" \
@@ -212,4 +227,30 @@ package_dpdfnet-ladspa-dpdfnet8-48khz-hr() {
 	pkgdesc='DPDFNet-8 48 kHz hi-res LADSPA plugin (full-band, highest quality)'
 	depends=("${_split_depends[@]}")
 	_install_model dpdfnet8_48khz_hr "${pkgname}"
+}
+
+# Split-band variants: the 16 kHz networks run at 48 kHz with the band above
+# 8 kHz reconstructed, so they are full-band and need no resampler in the graph.
+package_dpdfnet-ladspa-baseline-sb() {
+	pkgdesc='DPDFNet baseline split-band LADSPA plugin (full-band, lowest compute)'
+	depends=("${_split_depends[@]}")
+	_install_model baseline_sb "${pkgname}"
+}
+
+package_dpdfnet-ladspa-dpdfnet2-sb() {
+	pkgdesc='DPDFNet-2 split-band LADSPA plugin (full-band, balanced, no resampler)'
+	depends=("${_split_depends[@]}")
+	_install_model dpdfnet2_sb "${pkgname}"
+}
+
+package_dpdfnet-ladspa-dpdfnet4-sb() {
+	pkgdesc='DPDFNet-4 split-band LADSPA plugin (full-band, higher quality)'
+	depends=("${_split_depends[@]}")
+	_install_model dpdfnet4_sb "${pkgname}"
+}
+
+package_dpdfnet-ladspa-dpdfnet8-sb() {
+	pkgdesc='DPDFNet-8 split-band LADSPA plugin (full-band, highest quality)'
+	depends=("${_split_depends[@]}")
+	_install_model dpdfnet8_sb "${pkgname}"
 }

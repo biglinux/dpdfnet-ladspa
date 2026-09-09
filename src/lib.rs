@@ -38,6 +38,7 @@ use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 mod engine;
+mod highband;
 
 use engine::{Inference, MAX_DEPTH};
 
@@ -154,7 +155,10 @@ pub unsafe extern "C" fn dpdfnet_hops(total: *mut u64, enhanced: *mut u64) {
 /// delivered and wrong again by however far the block sat from 20 ms.
 #[no_mangle]
 pub extern "C" fn dpdfnet_added_latency_frames() -> u32 {
-    ((MODEL_DELAY_HOPS + EMIT_LAG_HOPS) * model_const::HOP_SIZE + model_const::WIN_LEN) as u32
+    // Expressed in host samples: on a split-band build the hop and window are
+    // the 48 kHz STFT's, not the 16 kHz model's, so the published figure is the
+    // audio the graph actually sees delayed.
+    ((MODEL_DELAY_HOPS + EMIT_LAG_HOPS) * model_const::STFT_HOP + model_const::STFT_WIN_LEN) as u32
 }
 
 /// The host sample rate this build's model requires. A filter chain running
@@ -198,6 +202,35 @@ fn vorbis_window(win_len: usize) -> Vec<f32> {
             (0.5 * std::f32::consts::PI * s * s).sin()
         })
         .collect()
+}
+
+/// Raised-cosine blend across the four bins straddling the model / high-band
+/// boundary, so the enhanced low band and the reconstructed high band do not
+/// meet at a hard edge. A no-op when there is no high band (`low_bins ==
+/// spectrum.len()`, the non-split build).
+fn crossfade_boundary(spectrum: &mut [Complex<f32>], low_bins: usize) {
+    const WIDTH: usize = 4;
+    if low_bins < WIDTH / 2 || low_bins + WIDTH / 2 > spectrum.len() {
+        return;
+    }
+    let base = low_bins - WIDTH / 2;
+    let snapshot: [Complex<f32>; WIDTH] = std::array::from_fn(|k| spectrum[base + k]);
+    let low = [snapshot[0], snapshot[1]]; // pure model side
+    let high = [snapshot[2], snapshot[3]]; // pure high-band side
+    for k in 0..WIDTH {
+        let t = (k as f32 + 0.5) / WIDTH as f32;
+        let w = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
+        let model_val = if k < WIDTH / 2 { low[k] } else { low[1] };
+        let hf_val = if k >= WIDTH / 2 {
+            high[k - WIDTH / 2]
+        } else {
+            high[0]
+        };
+        spectrum[base + k] = Complex::new(
+            model_val.re * (1.0 - w) + hf_val.re * w,
+            model_val.im * (1.0 - w) + hf_val.im * w,
+        );
+    }
 }
 
 struct DpdfnetPlugin {
@@ -258,9 +291,20 @@ struct DpdfnetPlugin {
     fft_fwd: Arc<dyn RealToComplex<f32>>,
     fft_inv: Arc<dyn ComplexToReal<f32>>,
     fft_real: Vec<f32>,
+    /// Forward-FFT result: the original noisy spectrum, `STFT_FREQ_BINS` long.
+    /// For a split-band build this is wider than the model band, and the bins
+    /// above the model cutoff are the high band the model never sees.
     fft_complex: Vec<Complex<f32>>,
+    /// Enhanced spectrum assembled for the inverse FFT: the model's low band
+    /// scaled back up, plus the reconstructed high band. Same width as
+    /// `fft_complex`; equal to it bin-for-bin on a non-split build.
+    out_complex: Vec<Complex<f32>>,
     spec_in: Vec<f32>,
     spec_out: Vec<f32>,
+    /// High-band reconstruction and its speech gate — only a split-band build
+    /// carries them; a normal build's high band is empty.
+    highband: Option<highband::HighBand>,
+    speech_gate: highband::SpeechGate,
 }
 
 impl DpdfnetPlugin {
@@ -268,16 +312,18 @@ impl DpdfnetPlugin {
         let sr = sample_rate as usize;
         // A wrong host rate used to abort the process. LADSPA cannot refuse
         // an instantiation, so refuse the model instead: `rate_ok` false
-        // means the engine is never asked for and audio passes through.
-        let rate_ok = sr == model_const::SAMPLE_RATE;
+        // means the engine is never asked for and audio passes through. The
+        // rate the plugin accepts is the STFT/host rate — 48 kHz for a
+        // split-band build, whose model band stays 16 kHz internally.
+        let rate_ok = sr == model_const::HOST_SAMPLE_RATE;
         if !rate_ok {
             eprintln!(
                 "[{}] host sample rate is {sr} Hz, this plugin needs {}; \
                  passing audio through unprocessed. Set `audio.rate = {}` \
                  on the filter-chain node.",
                 model_const::LADSPA_LABEL,
-                model_const::SAMPLE_RATE,
-                model_const::SAMPLE_RATE
+                model_const::HOST_SAMPLE_RATE,
+                model_const::HOST_SAMPLE_RATE
             );
         }
 
@@ -286,9 +332,20 @@ impl DpdfnetPlugin {
         // one, so an idle chain does not pay the OpenVINO Core and JIT cost;
         // when audio starts, the first frames pass through clean until the
         // build lands (170-460 ms depending on the model).
+        // The STFT runs at the host geometry (== the model geometry on a
+        // normal build, wider on a split-band one). The model band stays
+        // `FREQ_BINS` and is extracted from the low end of this spectrum.
         let mut planner = RealFftPlanner::<f32>::new();
-        let fft_fwd = planner.plan_fft_forward(model_const::WIN_LEN);
-        let fft_inv = planner.plan_fft_inverse(model_const::WIN_LEN);
+        let fft_fwd = planner.plan_fft_forward(model_const::STFT_WIN_LEN);
+        let fft_inv = planner.plan_fft_inverse(model_const::STFT_WIN_LEN);
+        let hf_bins = model_const::STFT_FREQ_BINS - model_const::FREQ_BINS;
+        let highband = model_const::SPLIT_BAND.then(|| {
+            highband::HighBand::new(
+                hf_bins,
+                model_const::STFT_HOP,
+                model_const::HOST_SAMPLE_RATE,
+            )
+        });
 
         Self {
             inference: Inference::new(),
@@ -318,40 +375,47 @@ impl DpdfnetPlugin {
             // periodic clicks / robotic timbre at the host quantum
             // rate). Latency cost: WIN_LEN/sr ≈ 20 ms.
             in_buf: {
-                // Primed with WIN_LEN zeros but reserved for a whole block on
-                // top: the first `run()` appends before it consumes, and that
-                // first callback is exactly the one this plugin must not
+                // Primed with STFT_WIN_LEN zeros but reserved for a whole block
+                // on top: the first `run()` appends before it consumes, and
+                // that first callback is exactly the one this plugin must not
                 // stall in.
-                let mut buf = Vec::with_capacity(MAX_HOST_BLOCK + model_const::WIN_LEN);
-                buf.resize(model_const::WIN_LEN, 0.0);
+                let mut buf = Vec::with_capacity(MAX_HOST_BLOCK + model_const::STFT_WIN_LEN);
+                buf.resize(model_const::STFT_WIN_LEN, 0.0);
                 buf
             },
-            ola_buf: vec![0.0; model_const::WIN_LEN],
-            out_queue: VecDeque::with_capacity(MAX_HOST_BLOCK + model_const::WIN_LEN),
-            window: vorbis_window(model_const::WIN_LEN),
-            fft_real: vec![0.0; model_const::WIN_LEN],
-            fft_complex: vec![Complex::new(0.0, 0.0); model_const::FREQ_BINS],
+            ola_buf: vec![0.0; model_const::STFT_WIN_LEN],
+            out_queue: VecDeque::with_capacity(MAX_HOST_BLOCK + model_const::STFT_WIN_LEN),
+            window: vorbis_window(model_const::STFT_WIN_LEN),
+            fft_real: vec![0.0; model_const::STFT_WIN_LEN],
+            fft_complex: vec![Complex::new(0.0, 0.0); model_const::STFT_FREQ_BINS],
+            out_complex: vec![Complex::new(0.0, 0.0); model_const::STFT_FREQ_BINS],
             fft_fwd,
             fft_inv,
             spec_in: vec![0.0; model_const::FREQ_BINS * 2],
             spec_out: vec![0.0; model_const::FREQ_BINS * 2],
+            highband,
+            speech_gate: highband::SpeechGate::new(),
         }
     }
 
     /// Process exactly one analysis frame: window + FFT + ONNX +
-    /// spectral blend + iFFT + windowed OLA + flush HOP samples to
-    /// `out_queue`. Caller guarantees `in_buf.len() >= WIN_LEN`.
+    /// spectral blend + high-band reconstruction + iFFT + windowed OLA + flush
+    /// HOP samples to `out_queue`. Caller guarantees
+    /// `in_buf.len() >= STFT_WIN_LEN`.
     fn process_frame(&mut self, alpha: f32) {
-        for j in 0..model_const::WIN_LEN {
+        for j in 0..model_const::STFT_WIN_LEN {
             self.fft_real[j] = self.in_buf[j] * self.window[j];
         }
         let _ = self
             .fft_fwd
             .process(&mut self.fft_real, &mut self.fft_complex);
 
-        for (k, c) in self.fft_complex.iter().enumerate() {
-            self.spec_in[k * 2] = c.re;
-            self.spec_in[k * 2 + 1] = c.im;
+        // The model only ever sees the low `FREQ_BINS` bins. On a split-band
+        // build the STFT is wider, so scale those bins to the magnitude the
+        // 16 kHz network was trained on (`SPECTRUM_SCALE` is 1.0 otherwise).
+        for k in 0..model_const::FREQ_BINS {
+            self.spec_in[k * 2] = self.fft_complex[k].re * model_const::SPECTRUM_SCALE;
+            self.spec_in[k * 2 + 1] = self.fft_complex[k].im * model_const::SPECTRUM_SCALE;
         }
 
         HOPS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -398,34 +462,59 @@ impl DpdfnetPlugin {
             }
         }
 
+        // Assemble the enhanced full-width spectrum for the inverse FFT. The
+        // model's low band is scaled back up to the host magnitude; on a
+        // split-band build the band above the model cutoff is reconstructed
+        // from the original high band and the clean low band.
+        let inv_scale = 1.0 / model_const::SPECTRUM_SCALE;
         for k in 0..model_const::FREQ_BINS {
-            self.fft_complex[k] = Complex::new(self.spec_out[k * 2], self.spec_out[k * 2 + 1]);
+            self.out_complex[k] = Complex::new(
+                self.spec_out[k * 2] * inv_scale,
+                self.spec_out[k * 2 + 1] * inv_scale,
+            );
         }
+        if let Some(highband) = self.highband.as_mut() {
+            let input_energy: f32 = (0..model_const::FREQ_BINS)
+                .map(|k| self.spec_in[k * 2].powi(2) + self.spec_in[k * 2 + 1].powi(2))
+                .sum();
+            let enhanced_energy: f32 = (0..model_const::FREQ_BINS)
+                .map(|k| self.spec_out[k * 2].powi(2) + self.spec_out[k * 2 + 1].powi(2))
+                .sum();
+            let speech = self.speech_gate.update(input_energy, enhanced_energy);
+
+            highband.process(
+                &self.fft_complex[model_const::FREQ_BINS..],
+                speech,
+                &mut self.out_complex[model_const::FREQ_BINS..],
+            );
+            crossfade_boundary(&mut self.out_complex, model_const::FREQ_BINS);
+        }
+
         let _ = self
             .fft_inv
-            .process(&mut self.fft_complex, &mut self.fft_real);
+            .process(&mut self.out_complex, &mut self.fft_real);
 
         // realfft inverse leaves a 1/N scaling — fold into the synthesis
         // window so OLA gets the correct amplitude.
-        let scale = 1.0 / model_const::WIN_LEN as f32;
-        for j in 0..model_const::WIN_LEN {
+        let scale = 1.0 / model_const::STFT_WIN_LEN as f32;
+        for j in 0..model_const::STFT_WIN_LEN {
             self.ola_buf[j] += self.fft_real[j] * scale * self.window[j];
         }
 
         // First HOP samples of the OLA accumulator are now stable.
-        for j in 0..model_const::HOP_SIZE {
+        for j in 0..model_const::STFT_HOP {
             self.out_queue.push_back(self.ola_buf[j]);
         }
         self.ola_buf
-            .copy_within(model_const::HOP_SIZE..model_const::WIN_LEN, 0);
-        for j in (model_const::WIN_LEN - model_const::HOP_SIZE)..model_const::WIN_LEN {
+            .copy_within(model_const::STFT_HOP..model_const::STFT_WIN_LEN, 0);
+        for j in (model_const::STFT_WIN_LEN - model_const::STFT_HOP)..model_const::STFT_WIN_LEN {
             self.ola_buf[j] = 0.0;
         }
 
         // Slide analysis window forward by HOP samples.
-        self.in_buf.copy_within(model_const::HOP_SIZE.., 0);
+        self.in_buf.copy_within(model_const::STFT_HOP.., 0);
         self.in_buf
-            .truncate(self.in_buf.len() - model_const::HOP_SIZE);
+            .truncate(self.in_buf.len() - model_const::STFT_HOP);
     }
 
     /// Fill `spec_out` with the answer for hop `due`: the enhanced spectrum if
@@ -581,7 +670,7 @@ impl Plugin for DpdfnetPlugin {
         // itself back off and sit at a few per cent enhanced.
         let now = Instant::now();
         let started = *self.last_run.get_or_insert(now);
-        self.audio_seen += n as f64 / model_const::SAMPLE_RATE as f64;
+        self.audio_seen += n as f64 / model_const::HOST_SAMPLE_RATE as f64;
         if !self.offline && self.audio_seen > OFFLINE_WARMUP_S {
             let elapsed = now.duration_since(started).as_secs_f64();
             self.offline = self.audio_seen > elapsed * 4.0;
@@ -591,21 +680,23 @@ impl Plugin for DpdfnetPlugin {
         // the callback's own start: a hop that spends it all leaves the rest of
         // the block emitting noisy frames rather than pushing the whole graph
         // past its deadline.
-        self.wait_until =
-            now + Duration::from_secs_f64(n as f64 / model_const::SAMPLE_RATE as f64 * WAIT_BUDGET);
+        self.wait_until = now
+            + Duration::from_secs_f64(
+                n as f64 / model_const::HOST_SAMPLE_RATE as f64 * WAIT_BUDGET,
+            );
 
         // One callback carries this many analysis hops, back to back with no
         // wall clock between them, so that is how many submissions the engine
         // has to accept before refusing. It used to be the emitted hop's lag
         // too, which is what made the latency the host's block.
-        let hops_per_callback = n.div_ceil(model_const::HOP_SIZE).max(1);
+        let hops_per_callback = n.div_ceil(model_const::STFT_HOP).max(1);
         if hops_per_callback != self.depth {
             self.depth = hops_per_callback;
             self.inference.set_depth(hops_per_callback);
         }
         self.in_buf.extend_from_slice(&input[..n]);
 
-        while self.in_buf.len() >= model_const::WIN_LEN {
+        while self.in_buf.len() >= model_const::STFT_WIN_LEN {
             self.process_frame(alpha);
         }
 
@@ -678,7 +769,7 @@ mod tests {
     fn no_callback_grows_a_buffer() {
         let descriptor = get_ladspa_descriptor(0).expect("descriptor");
         let ports = descriptor.ports.clone();
-        let mut plugin = DpdfnetPlugin::new(MODEL_SAMPLE_RATE as u64);
+        let mut plugin = DpdfnetPlugin::new(model_const::HOST_SAMPLE_RATE as u64);
         plugin.activate();
 
         // The largest block we reserve for, driven at once so the first
