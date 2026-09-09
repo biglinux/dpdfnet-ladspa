@@ -41,11 +41,52 @@ mod engine;
 
 use engine::{Inference, MAX_DEPTH};
 
-/// Hops one 40 ms callback carries — the block the BigLinux chain negotiates,
-/// and therefore the handoff depth the reported latency assumes. A graph that
-/// settles on a different block gets a different real latency; this is the one
-/// worth declaring.
-const SHIPPED_DEPTH_HOPS: usize = 40 * model_const::SAMPLE_RATE / 1000 / model_const::HOP_SIZE;
+/// Hops the network's answer is already behind the frame it was asked about.
+///
+/// The model returns the enhanced spectrum of a frame four hops older than the
+/// one submitted. Measured on the shipped graph, driven frame by frame through
+/// a minimal host: the reconstruction correlates with its input at exactly
+/// 1920 samples at 48 kHz and 640 at 16 kHz — 4.00 hops either way. It is also
+/// what the OBS filter built on the same ONNX documents ("four hops (40 ms) of
+/// internal signal delay"), which it reads from an `output_delay_hops`
+/// metadata key — a key neither that ONNX nor this IR actually carries, which
+/// is why the figure is a constant here.
+///
+/// The delay itself is not avoidable: the enhanced audio of a frame cannot
+/// leave before the network has seen four more. What it must not do is go
+/// unaccounted, which is what made the dry fallback jump 40 ms ahead of the
+/// enhanced path and the attenuation blend sum two different instants.
+const MODEL_DELAY_HOPS: usize = 4;
+
+/// Hops between the frame handed to the worker and the frame going out.
+///
+/// One, so the delay this plugin adds no longer depends on the host's block.
+/// It used to be the whole callback: the same model cost 80 ms in a chain at a
+/// 960-sample quantum, 140 ms at 3840, and 150 ms in ffmpeg's converter.
+///
+/// A lag this short means the answer is not there yet when the hop comes due —
+/// a callback carries its hops back to back with no wall clock between them,
+/// so lowering the lag *alone* took the pause floor from −15.91 dB to
+/// −2.94 dB, nearly every hop coming back raw. It works only together with
+/// [`WAIT_BUDGET`]: the callback waits for the worker instead of giving up on
+/// it.
+const EMIT_LAG_HOPS: usize = 1;
+
+/// Share of a callback's own duration the plugin may spend waiting for the
+/// worker before it emits noisy hops for the rest of that callback.
+///
+/// Inference costs 3.3 ms per 10 ms hop for the heaviest model, so half the
+/// period covers a whole callback of hops with margin and still leaves the
+/// other half of the quantum to the rest of the graph. Running out is not an
+/// error: the hop goes out noisy but time-aligned, which is the degradation
+/// this plugin was built around.
+const WAIT_BUDGET: f64 = 0.5;
+
+/// Noisy frames the delay line holds: the handoff lag, the model's own delay,
+/// and one being retired. Fixed, now that the lag is — the pool used to carry
+/// one buffer per possible callback depth, 66 of them, for a line that is
+/// never more than six deep.
+const DRY_LINE: usize = EMIT_LAG_HOPS + MODEL_DELAY_HOPS + 2;
 
 mod model_const {
     // `MODEL_NAME` ships for diagnostics / log lines; the LADSPA hot
@@ -106,12 +147,14 @@ pub unsafe extern "C" fn dpdfnet_hops(total: *mut u64, enhanced: *mut u64) {
 /// a second constant would drift from the binary at the first partial
 /// upgrade. Reading it out of the `.so` cannot drift, because it is the
 /// `.so`. A caller that finds no such symbol is looking at an older plugin.
+/// Three terms, none of them the host's: the network's own four hops, the one
+/// hop of handoff lag, and the analysis window the constructor primes — 70 ms
+/// at 48 kHz. The model's share used to be missing and the handoff was the
+/// host's whole block, so the published number was 40 ms short of the audio
+/// delivered and wrong again by however far the block sat from 20 ms.
 #[no_mangle]
 pub extern "C" fn dpdfnet_added_latency_frames() -> u32 {
-    // The handoff is as deep as the hops one callback carries, so the number
-    // depends on the block the graph settled on. Reported for the shipped
-    // 40 ms block; the analysis window the constructor primes is on top.
-    (SHIPPED_DEPTH_HOPS * model_const::HOP_SIZE + model_const::WIN_LEN) as u32
+    ((MODEL_DELAY_HOPS + EMIT_LAG_HOPS) * model_const::HOP_SIZE + model_const::WIN_LEN) as u32
 }
 
 /// The host sample rate this build's model requires. A filter chain running
@@ -177,9 +220,13 @@ struct DpdfnetPlugin {
     blend_ref: Vec<f32>,
     /// Hops seen since this stream started.
     hop: u64,
-    /// How far behind the worker is allowed to run: the hops one callback
-    /// carries. Recomputed whenever the host changes the block size.
+    /// Submissions the engine will accept before refusing: the hops one
+    /// callback carries. Recomputed whenever the host changes the block size.
     depth: usize,
+    /// Wall clock the current callback may wait until before it stops asking
+    /// the worker for answers. [`WAIT_BUDGET`] of the callback's own duration,
+    /// set once per callback so the hops inside it share one budget.
+    wait_until: Instant,
     /// True once the host has been seen feeding audio faster than real time,
     /// which means it is a file converter and has no deadline to miss. Then
     /// the callback may wait for the worker instead of emitting raw audio.
@@ -245,16 +292,19 @@ impl DpdfnetPlugin {
 
         Self {
             inference: Inference::new(),
-            // Sized for the deepest handoff so the audio thread never grows
-            // it; the entries themselves are reused, never reallocated.
-            dry_delay: VecDeque::with_capacity(MAX_DEPTH + 2),
+            // The dry line is exactly as deep as the handoff; `submitted` has
+            // to hold whatever the engine accepted, which is a callback's
+            // worth. Neither grows on the audio thread, and the entries
+            // themselves are reused rather than reallocated.
+            dry_delay: VecDeque::with_capacity(DRY_LINE),
             submitted: VecDeque::with_capacity(MAX_DEPTH + 2),
-            dry_spares: (0..MAX_DEPTH + 2)
+            dry_spares: (0..DRY_LINE)
                 .map(|_| vec![0.0; model_const::FREQ_BINS * 2])
                 .collect(),
             blend_ref: vec![0.0; model_const::FREQ_BINS * 2],
             hop: 0,
             depth: 1,
+            wait_until: Instant::now(),
             offline: false,
             audio_seen: 0.0,
             last_run: None,
@@ -308,22 +358,21 @@ impl DpdfnetPlugin {
         let hop = self.hop;
         self.hop += 1;
 
-        // Collect before handing over. The queue is exactly `depth` deep, so
-        // a submit before the collect always finds it full and is refused —
-        // that mistake cost 76 % of the hops at a 1920-sample block.
+        // Collect before handing over. The engine's window is exactly `depth`
+        // deep, so a submit before the collect always finds it full and is
+        // refused — that mistake cost 76 % of the hops at a 1920-sample block.
         //
-        // What goes out now is the hop from `depth` back: far enough that the
-        // worker has had a whole callback of wall clock to answer it, which
-        // is the only interval it gets, since one callback carries several
-        // hops with no time between them.
-        // Nothing is due until the delay line has filled. Saturating this to
-        // zero instead made the first `depth` hops all claim hop 0, and each
-        // one popped a different entry off `submitted` — after which the tag
-        // the collector expected never matched a tag the worker sent again,
-        // for the rest of the stream.
-        let due = hop.checked_sub(self.depth as u64);
+        // What goes out now is the hop right behind this one, not the hop a
+        // whole callback back: a callback carrying nine hops used to delay the
+        // audio by nine, and every host got a different latency. Nothing is
+        // due until the delay line has filled. Saturating this to zero instead
+        // made the first hops all claim hop 0, and each one popped a different
+        // entry off `submitted` — after which the tag the collector expected
+        // never matched a tag the worker sent again, for the rest of the
+        // stream.
+        let due = hop.checked_sub(EMIT_LAG_HOPS as u64);
         match due {
-            Some(due) => self.emit_hop(due, self.offline),
+            Some(due) => self.emit_hop(due),
             None => self.spec_out.fill(0.0),
         }
 
@@ -380,14 +429,29 @@ impl DpdfnetPlugin {
     }
 
     /// Fill `spec_out` with the answer for hop `due`: the enhanced spectrum if
-    /// the worker produced it, otherwise the noisy one from that same hop.
+    /// the worker produced it, otherwise the noisy frame that sits at the same
+    /// instant.
     ///
     /// Both queues run in submission order, so pairing is a matter of
     /// discarding whatever is older than the hop being emitted. That only
     /// happens when the worker falls behind, and its late answer is out of
     /// time by then — one raw hop beats an output that jumps.
-    fn emit_hop(&mut self, due: u64, may_wait: bool) {
+    ///
+    /// "The same instant" is what makes the raw fallback usable, and it is not
+    /// hop `due`: the network answers about a frame [`MODEL_DELAY_HOPS`] older
+    /// than the one submitted, so the noisy spectrum that lines up with the
+    /// enhanced one is `due - MODEL_DELAY_HOPS`. Taking hop `due` instead put
+    /// the dry path 40 ms ahead of the enhanced path — a jump of exactly that
+    /// size whenever the worker missed a hop, and an attenuation blend that
+    /// summed two instants 40 ms apart instead of mixing one.
+    fn emit_hop(&mut self, due: u64) {
         let mut answered = false;
+        // The dry line cannot line up before it holds the model's own delay.
+        let Some(dry_due) = due.checked_sub(MODEL_DELAY_HOPS as u64) else {
+            self.spec_out.fill(0.0);
+            self.blend_ref.fill(0.0);
+            return;
+        };
 
         // Answers come back in submission order, so the front of `submitted`
         // names the next frame the worker will hand over. Comparing that tag
@@ -400,10 +464,15 @@ impl DpdfnetPlugin {
             if next > due {
                 break;
             }
-            let Some(frame) = (if may_wait {
-                self.inference.take_waiting(OFFLINE_WAIT)
-            } else {
+            // At a one-hop lag the answer is normally still in flight, so this
+            // is where the callback spends its budget. Recomputed per
+            // iteration: a stale frame discarded here already consumed part of
+            // it.
+            let waiting = self.wait_timeout();
+            let Some(frame) = (if waiting.is_zero() {
                 self.inference.take()
+            } else {
+                self.inference.take_waiting(waiting)
             }) else {
                 break;
             };
@@ -420,21 +489,19 @@ impl DpdfnetPlugin {
             }
         }
 
-        // Retire every noisy frame up to and including `due`, keeping the
-        // buffers. The one tagged `due` is the fallback when nothing enhanced
-        // arrived; anything older is the worker running behind.
+        // Retire every noisy frame up to and including `dry_due`, keeping the
+        // buffers. The one tagged `dry_due` is the fallback when nothing
+        // enhanced arrived; anything older is the worker running behind.
         while let Some(&(hop, _)) = self.dry_delay.front() {
-            if hop > due {
+            if hop > dry_due {
                 break;
             }
             let Some((_, buf)) = self.dry_delay.pop_front() else {
                 break;
             };
-            if hop == due {
-                // The noisy spectrum of the hop being emitted. The blend below
-                // needs this and not the hop just captured: they are `depth`
-                // hops apart, 40 ms at the shipped block, and summing two
-                // different instants combs the spectrum instead of blending it.
+            if hop == dry_due {
+                // The noisy spectrum at the instant the enhanced one describes,
+                // which is neither the hop just captured nor the hop submitted.
                 self.blend_ref.copy_from_slice(&buf);
                 if !answered {
                     self.spec_out.copy_from_slice(&buf);
@@ -450,6 +517,19 @@ impl DpdfnetPlugin {
         if !answered {
             self.spec_out.fill(0.0);
         }
+    }
+
+    /// How long this hop may block waiting for the worker.
+    ///
+    /// Whatever is left of the callback's budget, which is what makes a
+    /// one-hop lag possible at all. A host with no deadline — a file converter
+    /// — gets [`OFFLINE_WAIT`] instead, because there is nothing to be late
+    /// for and every hop should come back enhanced.
+    fn wait_timeout(&self) -> Duration {
+        if self.offline {
+            return OFFLINE_WAIT;
+        }
+        self.wait_until.saturating_duration_since(Instant::now())
     }
 
     /// Put this hop's noisy spectrum on the delay line, on a buffer that has
@@ -494,12 +574,6 @@ impl Plugin for DpdfnetPlugin {
 
         let n = sample_count.min(input.len()).min(output.len());
 
-        // One callback carries this many analysis hops, back to back with no
-        // wall clock between them, so that is exactly how far behind the
-        // worker has to be allowed to run. Pinning it at one let only the
-        // first hop of each callback come back enhanced: measured 24 % at a
-        // 1920-sample quantum, 48 % at 960, 90 % at 480.
-        //
         // A host that has handed over far more audio than time has passed is
         // reading a file, not a microphone. Compared cumulatively and latched
         // once true: the moment the callback starts waiting for the worker the
@@ -513,6 +587,17 @@ impl Plugin for DpdfnetPlugin {
             self.offline = self.audio_seen > elapsed * 4.0;
         }
 
+        // The hops in this callback share one waiting budget, measured from
+        // the callback's own start: a hop that spends it all leaves the rest of
+        // the block emitting noisy frames rather than pushing the whole graph
+        // past its deadline.
+        self.wait_until =
+            now + Duration::from_secs_f64(n as f64 / model_const::SAMPLE_RATE as f64 * WAIT_BUDGET);
+
+        // One callback carries this many analysis hops, back to back with no
+        // wall clock between them, so that is how many submissions the engine
+        // has to accept before refusing. It used to be the emitted hop's lag
+        // too, which is what made the latency the host's block.
         let hops_per_callback = n.div_ceil(model_const::HOP_SIZE).max(1);
         if hops_per_callback != self.depth {
             self.depth = hops_per_callback;
