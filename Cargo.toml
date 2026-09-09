@@ -22,6 +22,11 @@ default = []
 
 [dependencies]
 ladspa = "0.3"
+# Only for `sched_setscheduler`: the audio thread waits for our worker, so the
+# worker has to outrank ordinary work or the wait becomes scheduling luck.
+# Already in the lock file as a transitive dependency, so this adds nothing to
+# the build.
+libc = "0.2"
 # OpenVINO 2026.x is the system runtime on BigLinux (provided by the
 # `openvino` package). `runtime-linking` makes the bindings `dlopen` it on
 # first use instead of recording a versioned `DT_NEEDED`. Linking at build

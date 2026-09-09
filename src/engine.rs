@@ -257,6 +257,37 @@ pub struct Inference {
 /// How long a failed build is trusted to stay failed.
 const RETRY_AFTER: Duration = Duration::from_secs(5);
 
+/// Ask the scheduler to run this thread ahead of ordinary work.
+///
+/// The audio thread waits for this one now, and a real-time thread waiting on a
+/// normal thread is priority inversion. Measured under a 16-way CPU load with a
+/// 960-sample block: the callback's p99 spent 9.35 ms of its 20 ms period
+/// waiting with the worker at `SCHED_OTHER` and 2.58 ms with it real-time, and
+/// the share of hops that came back enhanced went from 99.8 % to 100 %. With
+/// real-time scheduling the wait is the model's compute time; without it, it is
+/// however long the run queue takes to get here.
+///
+/// Priority 1 is the lowest real-time band there is: ahead of every ordinary
+/// task, behind the host's data loop (FIFO 83 in `pwloader`) and behind kernel
+/// IRQ threads, so this cannot starve anything that matters. The thread spends
+/// its life blocked on a channel, so there is nothing here to run away.
+///
+/// Failure is not an error — a container or a user outside the audio group gets
+/// the previous behaviour, which works. It is worth one line, because a
+/// microphone that pumps under load looks like a model problem and is not.
+fn request_realtime() {
+    let param = libc::sched_param { sched_priority: 1 };
+    // SAFETY: `param` is fully initialised and outlives the call; a pid of 0
+    // means the calling thread on Linux.
+    if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &raw const param) } != 0 {
+        eprintln!(
+            "[{}] inference worker stays at normal priority; under CPU load \
+             some hops will come back unprocessed",
+            model_const::LADSPA_LABEL
+        );
+    }
+}
+
 impl Inference {
     #[must_use]
     pub fn new() -> Self {
@@ -266,6 +297,7 @@ impl Inference {
         let worker_failed = Arc::clone(&failed);
 
         let worker = thread::spawn(move || {
+            request_realtime();
             let mut engine: Option<Engine> = None;
             let mut state = crate::build_init_state();
             // Allocated once; the worker is not the audio thread but a

@@ -90,6 +90,7 @@ name = "dpdfnet-ladspa"
 version = "0.2.0"
 dependencies = [
  "ladspa",
+ "libc",
  "openvino",
  "realfft",
 ]
