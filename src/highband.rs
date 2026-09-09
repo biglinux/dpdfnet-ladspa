@@ -1,33 +1,29 @@
-//! High-frequency reconstruction for the split-band variants.
+//! High-band handling for the split-band variants.
 //!
 //! The 16 kHz DPDFNet networks only see 0–8 kHz. Run inside a 48 kHz graph
 //! through this wrapper, the STFT is 48 kHz (nfft 960) and the network is fed
 //! the low 161 bins; everything above 8 kHz (bins 161..481) never reaches the
-//! model. This processor fills that band so the output is full-band instead of
-//! telephone-band.
+//! model. This passes that captured band through, gated by the speech
+//! probability and a per-bin SNR gate so background noise above 8 kHz is
+//! attenuated while the real high band — fricatives, air — is kept. A short
+//! bypass after a transient keeps consonants ("t", "s", "k") from being gated.
 //!
-//! Two modes, chosen per frame by the high band's own SNR:
+//! It deliberately does **not** synthesize the high band. An earlier port
+//! carried the GTCRN air exciter, which mirrors 4–8 kHz up and squares it for a
+//! second harmonic when the high band's SNR is low. Measured on speech, that
+//! fired on 68–89 % of frames — even on clean speech, because voice carries
+//! almost no energy above 8 kHz outside fricatives, so the SNR is low most of
+//! the time. That meant the "full-band" output was mostly fabricated, not the
+//! captured voice, which is the opposite of what a natural-capture denoiser
+//! should do. A synthetic highs effect, if ever wanted, belongs in its own
+//! opt-in stage, not here.
 //!
-//! - **Spectral gate** — when the original >8 kHz content is clean enough to
-//!   keep, it is passed through, gated by the speech probability and a per-bin
-//!   SNR gate, with a short bypass after a transient so consonants ("t", "s",
-//!   "k") keep their edge.
-//! - **Air exciter** — when the high band is too noisy to keep, it is discarded
-//!   and synthesised from the enhanced 4–8 kHz band (second harmonic plus a
-//!   −6 dB/octave tilt), renormalised against the clean 6–8 kHz reference.
-//!
-//! Ported from the GTCRN LADSPA wrapper (BigLinux, MIT), which proved the
-//! approach; the bin numbers are recomputed for DPDFNet's 50 Hz/bin geometry
-//! (GTCRN runs 31.25 Hz/bin).
+//! Ported from the GTCRN LADSPA wrapper (BigLinux, MIT).
 
 use realfft::num_complex::Complex;
 
-/// Reconstructs the band the model does not see.
+/// Passes and gates the band the model does not see.
 pub struct HighBand {
-    /// Number of low (model) bins — the boundary the high band starts after.
-    low_bins: usize,
-    /// Hz per FFT bin, for turning frequencies into bin indices.
-    bin_hz: f32,
     /// Previous-frame high-band magnitudes, for spectral-flux transient
     /// detection.
     prev_mag: Vec<f32>,
@@ -35,20 +31,18 @@ pub struct HighBand {
     /// Frames of gate bypass left after a transient, and the full hold length.
     transient_hold: usize,
     transient_hold_frames: usize,
-    /// Adaptive per-bin noise floor, learned during silence.
+    /// Adaptive per-bin noise floor, learned during silence, for the SNR gate.
     noise_floor: Vec<f32>,
     noise_initialised: bool,
 }
 
 impl HighBand {
     /// `hf_bins` is the number of bins above the model cutoff (STFT bins minus
-    /// model bins); `bin_hz` is `host_rate / stft_win_len` (the FFT resolution).
-    pub fn new(low_bins: usize, hf_bins: usize, hop: usize, host_rate: usize, bin_hz: f32) -> Self {
+    /// model bins).
+    pub fn new(hf_bins: usize, hop: usize, host_rate: usize) -> Self {
         let frame_dur_s = hop as f64 / host_rate as f64;
         let hold_frames = (0.020 / frame_dur_s).ceil() as usize;
         Self {
-            low_bins,
-            bin_hz,
             prev_mag: vec![0.0; hf_bins],
             has_prev: false,
             transient_hold: 0,
@@ -58,15 +52,12 @@ impl HighBand {
         }
     }
 
-    /// Fill `output` (the high band) from the original high band and the clean
-    /// low band. `speech` is 0.0 (silence) .. 1.0 (speech).
-    ///
-    /// `hf_original` and `output` are the STFT bins above the model cutoff;
-    /// `enhanced_low` is the model's clean low band, complex, `low_bins` long.
+    /// Gate the captured high band into `output`. `speech` is 0.0 (silence) ..
+    /// 1.0 (speech). `hf_original` and `output` are the STFT bins above the
+    /// model cutoff.
     pub fn process(
         &mut self,
         hf_original: &[Complex<f32>],
-        enhanced_low: &[Complex<f32>],
         speech: f32,
         output: &mut [Complex<f32>],
     ) {
@@ -78,11 +69,7 @@ impl HighBand {
             self.transient_hold -= 1;
         }
 
-        if self.high_band_snr(hf_original) < 2.0 && self.noise_initialised {
-            self.synthesize_air(enhanced_low, output);
-        } else {
-            self.spectral_gate(hf_original, speech, output);
-        }
+        self.spectral_gate(hf_original, speech, output);
     }
 
     /// Half-wave-rectified spectral flux: a transient spikes positive flux
@@ -150,50 +137,6 @@ impl HighBand {
         }
     }
 
-    /// Synthesise the high band from the enhanced 4–8 kHz content when the
-    /// original is too noisy to keep. Mirrors that band up, generates a second
-    /// harmonic, tilts −6 dB/octave, renormalises against the clean 6–8 kHz
-    /// reference.
-    fn synthesize_air(&self, enhanced_low: &[Complex<f32>], output: &mut [Complex<f32>]) {
-        let hf_count = output.len();
-        output.fill(Complex::new(0.0, 0.0));
-
-        // Source is 4–8 kHz of the clean low band; reference is 6–8 kHz.
-        let src_start = ((4000.0 / self.bin_hz).round() as usize).min(self.low_bins);
-        let ref_start = ((6000.0 / self.bin_hz).round() as usize).min(self.low_bins);
-        let src_len = self.low_bins.saturating_sub(src_start).max(1);
-
-        let ref_energy: f32 = enhanced_low[ref_start..self.low_bins]
-            .iter()
-            .map(|c| c.norm())
-            .sum::<f32>()
-            / (self.low_bins - ref_start).max(1) as f32;
-        if ref_energy < 1e-10 {
-            return;
-        }
-
-        for (i, out) in output.iter_mut().enumerate().take(hf_count) {
-            let src = enhanced_low[src_start + (i % src_len)];
-            let mag = src.norm();
-            let harmonic = mag * mag; // second harmonic
-            let freq = 8000.0 + i as f32 * self.bin_hz;
-            let tilt = 1.0 / (freq / 8000.0); // −6 dB/octave above 8 kHz
-            let phase = src.im.atan2(src.re);
-            let final_mag = harmonic * tilt;
-            *out = Complex::new(final_mag * phase.cos(), final_mag * phase.sin());
-        }
-
-        let synth_energy: f32 =
-            output.iter().map(|c| c.norm()).sum::<f32>() / hf_count.max(1) as f32;
-        if synth_energy > 1e-10 {
-            let ratio = (ref_energy * 0.4 / synth_energy).min(3.0);
-            for c in output.iter_mut() {
-                c.re *= ratio;
-                c.im *= ratio;
-            }
-        }
-    }
-
     /// Learn the per-bin high-band noise floor while there is no speech.
     fn update_noise_floor(&mut self, hf: &[Complex<f32>], speech: f32) {
         if speech >= 0.1 {
@@ -210,30 +153,13 @@ impl HighBand {
         }
         self.noise_initialised = true;
     }
-
-    /// Mean per-bin SNR of the high band against the learned floor.
-    fn high_band_snr(&self, hf: &[Complex<f32>]) -> f32 {
-        if !self.noise_initialised {
-            return 10.0;
-        }
-        let count = hf.len().min(self.noise_floor.len());
-        if count == 0 {
-            return 0.0;
-        }
-        let total: f32 = hf[..count]
-            .iter()
-            .enumerate()
-            .map(|(i, c)| c.norm() / (self.noise_floor[i] + 1e-10))
-            .sum();
-        total / count as f32
-    }
 }
 
 /// Smoothed speech probability from the low band's input vs. enhanced energy.
 ///
-/// The high-band processor needs a 0..1 speech gate; the DPDFNet network does
-/// not emit one, so derive it the way the GTCRN wrapper does — from energy.
-/// The denoiser keeps speech and removes noise, so the enhanced-to-input energy
+/// The high-band gate needs a 0..1 speech gate; the DPDFNet network does not
+/// emit one, so derive it the way the GTCRN wrapper does — from energy. The
+/// denoiser keeps speech and removes noise, so the enhanced-to-input energy
 /// ratio is high during voice and low in a pause; an onset over a tracked input
 /// floor primes the gate so the first syllable is not gated out.
 pub struct SpeechGate {

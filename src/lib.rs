@@ -341,11 +341,9 @@ impl DpdfnetPlugin {
         let hf_bins = model_const::STFT_FREQ_BINS - model_const::FREQ_BINS;
         let highband = model_const::SPLIT_BAND.then(|| {
             highband::HighBand::new(
-                model_const::FREQ_BINS,
                 hf_bins,
                 model_const::STFT_HOP,
                 model_const::HOST_SAMPLE_RATE,
-                model_const::HOST_SAMPLE_RATE as f32 / model_const::STFT_WIN_LEN as f32,
             )
         });
 
@@ -484,12 +482,10 @@ impl DpdfnetPlugin {
                 .sum();
             let speech = self.speech_gate.update(input_energy, enhanced_energy);
 
-            let (low, high) = self.out_complex.split_at_mut(model_const::FREQ_BINS);
             highband.process(
                 &self.fft_complex[model_const::FREQ_BINS..],
-                low,
                 speech,
-                high,
+                &mut self.out_complex[model_const::FREQ_BINS..],
             );
             crossfade_boundary(&mut self.out_complex, model_const::FREQ_BINS);
         }
