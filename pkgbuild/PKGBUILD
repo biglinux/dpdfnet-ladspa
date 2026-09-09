@@ -19,11 +19,12 @@ pkgver=$(date +%y.%m.%d)
 pkgrel=$(date +%H%M)
 arch=('x86_64')
 url='https://github.com/ceva-ip/DPDFNet'
-# Upstream (ceva-ip/DPDFNet) ships LICENSE as Apache-2.0 — both the
-# source code and the published ONNX weights on HF are covered.
+# The shipped .so is our MIT plugin code with upstream's Apache-2.0 model
+# embedded in it, so both apply. Upstream (ceva-ip/DPDFNet) ships LICENSE as
+# Apache-2.0 covering both its source and the published ONNX weights on HF.
 # Citation: Rika, Sapir, Gus (2025) "DPDFNet: Boosting DeepFilterNet2
 # via Dual-Path RNN".
-license=('Apache-2.0')
+license=('MIT' 'Apache-2.0')
 makedepends=(
 	'cargo'
 	'rust'
@@ -37,12 +38,27 @@ makedepends=(
 )
 options=('!lto')
 
+# Every split ships the same shared object, so they share one dependency
+# list. The crate builds with the openvino crate's `runtime-linking`
+# feature, so the .so carries no versioned DT_NEEDED and an `openvino`
+# update cannot leave it present-but-unloadable again — which is what
+# 2026.1→2026.2 and 2026.2→2026.3 each did, crashing the
+# bigaudioimprove mic unit both times. A plain dependency is now enough.
+_split_depends=('gcc-libs' 'glibc' 'openvino')
+
 # Upstream weights live on Hugging Face. The `dpdfnet` Python package
 # wraps a download_model() helper, but plain HTTPS pulls keep the
 # build dependency surface small (no `python-filelock`, no Hugging Face
 # CLI) and let `makepkg` cache the artifacts the same way it caches
 # any other tarball.
-_hf_base='https://huggingface.co/Ceva-IP/DPDFNet/resolve/main/onnx'
+# Pinned to a commit, not to `main`: a branch makes the download
+# unreproducible and the checksums below meaningless. Bump both together,
+# taking the new sums from Hugging Face's `x-linked-etag` header, which is
+# the file's sha256 — no need to download to re-pin. That header and the
+# download share an origin, so it is a convenience, not a second opinion;
+# the copies already in the build cache are what corroborated these.
+_hf_rev='dd6818d00f50c836fed43a6243ebe49116de5964'
+_hf_base="https://huggingface.co/Ceva-IP/DPDFNet/resolve/${_hf_rev}/onnx"
 
 # Source array order MUST match _models below — the build loop indexes
 # both arrays positionally.
@@ -73,12 +89,19 @@ source=(
 	'LICENSE-DPDFNet::https://raw.githubusercontent.com/ceva-ip/DPDFNet/main/LICENSE'
 )
 
-# `SKIP` until the upstream HF repository pins specific revisions —
-# the model registry currently tracks `main`, so checksums would
-# invalidate on every Hugging Face commit even for unrelated metadata
-# tweaks. Re-pin with explicit sha256s once we move to a fixed
-# revision in `_hf_base`.
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+# `SKIP` only for the git checkout, where makepkg has no stable object to
+# hash. Every downloaded file is pinned: the models by the `_hf_rev` commit
+# above, the licence by content.
+sha256sums=(
+	'SKIP'
+	'371d26182aff0e1e0d31354e24c81f79cd57458f5a7dd003fc10a7ebf64255e0'
+	'4f0ee28935b4a32abecc717d745416976565834d839601acf43031094b4dc94c'
+	'42a386d3601922f474c4309927e1f471cce422e9bd8e3fd3967bb943bac36c01'
+	'899d4f23f3ff86edbffa8c537e4bcbdc49da1b4e84e0ef390611e0604a3b26cb'
+	'7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b'
+	'7b3afbb260a08fe9af3d16e3bda992971be1e7e951d1dee7c2d235f5c43f5631'
+	'c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4'
+)
 
 prepare() {
 	# The repo is cloned by makepkg into ${srcdir}/${pkgbase}. The
@@ -136,46 +159,57 @@ _install_model() {
 	# every binary distribution.
 	install -Dm644 "${srcdir}/LICENSE-DPDFNet" \
 		"${pkgdir}/usr/share/licenses/${pkg}/LICENSE"
+
+	# §4(b) requires modified files to carry a prominent notice saying so.
+	# We do not ship upstream's ONNX: `scripts/prepare_model.py` converts it
+	# to OpenVINO IR, which the plugin embeds. Say that next to the licence
+	# rather than only in a commit message.
+	install -Dm644 /dev/stdin \
+		"${pkgdir}/usr/share/licenses/${pkg}/NOTICE" <<-NOTICE
+			This package contains a modified form of the DPDFNet model
+			"${model}" from https://github.com/ceva-ip/DPDFNet, licensed
+			under Apache-2.0.
+
+			Modification: the upstream ONNX weights (Hugging Face revision
+			${_hf_rev}) were converted to OpenVINO IR by the project's
+			scripts/prepare_model.py, and the resulting model.xml/model.bin
+			are embedded in the shipped LADSPA shared object. The network
+			itself is unchanged.
+		NOTICE
 }
 
 package_dpdfnet-ladspa-baseline() {
 	pkgdesc='DPDFNet 16 kHz baseline LADSPA plugin (fastest, 0-8 kHz band)'
-	depends=('gcc-libs' 'glibc' 'openvino')
-	provides=('ladspa-host')
+	depends=("${_split_depends[@]}")
 	_install_model baseline "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet2() {
 	pkgdesc='DPDFNet-2 16 kHz LADSPA plugin (balanced quality/speed, upstream default)'
-	depends=('gcc-libs' 'glibc' 'openvino')
-	provides=('ladspa-host')
+	depends=("${_split_depends[@]}")
 	_install_model dpdfnet2 "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet4() {
 	pkgdesc='DPDFNet-4 16 kHz LADSPA plugin (higher quality, deeper DPRNN stack)'
-	depends=('gcc-libs' 'glibc' 'openvino')
-	provides=('ladspa-host')
+	depends=("${_split_depends[@]}")
 	_install_model dpdfnet4 "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet8() {
 	pkgdesc='DPDFNet-8 16 kHz LADSPA plugin (highest quality 16 kHz variant)'
-	depends=('gcc-libs' 'glibc' 'openvino')
-	provides=('ladspa-host')
+	depends=("${_split_depends[@]}")
 	_install_model dpdfnet8 "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet2-48khz-hr() {
 	pkgdesc='DPDFNet-2 48 kHz hi-res LADSPA plugin (full-band, balanced)'
-	depends=('gcc-libs' 'glibc' 'openvino')
-	provides=('ladspa-host')
+	depends=("${_split_depends[@]}")
 	_install_model dpdfnet2_48khz_hr "${pkgname}"
 }
 
 package_dpdfnet-ladspa-dpdfnet8-48khz-hr() {
 	pkgdesc='DPDFNet-8 48 kHz hi-res LADSPA plugin (full-band, highest quality)'
-	depends=('gcc-libs' 'glibc' 'openvino')
-	provides=('ladspa-host')
+	depends=("${_split_depends[@]}")
 	_install_model dpdfnet8_48khz_hr "${pkgname}"
 }

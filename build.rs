@@ -22,11 +22,17 @@ use std::path::PathBuf;
 /// All models documented in `ceva-ip/DPDFNet@main:package/src/dpdfnet/models.py`.
 /// Entries: `(registry_name, sample_rate_hz, description)`.
 ///
-/// `frame_ms = 20.0` upstream, so STFT geometry is fully derivable
-/// from the sample rate (WIN = SR * 0.02, HOP = WIN / 2,
-/// FREQ_BINS = WIN / 2 + 1). State size depends on the number of
-/// DPRNN blocks and is read at build time from `init_state.bin`'s
-/// length (4 bytes per f32).
+/// There is deliberately no per-model block size here any more. Inference
+/// runs on a worker thread, so the audio callback does the FFT, the
+/// overlap-add and two buffer copies and nothing else — its cost no longer
+/// depends on the model. `tests/callback_deadline.rs` holds every model to
+/// every block from 10 ms up.
+///
+/// What still varies per model is whether the worker keeps up: 3.3 ms of
+/// inference per 10 ms hop for DPDFNet-8, a third of a core. That is a
+/// CPU-load question for the quality tier, and the plugin reports it on the
+/// `Hops Total` and `Hops Enhanced` control ports rather than promising it
+/// here.
 const REGISTRY: &[(&str, usize, &str)] = &[
     (
         "baseline",
@@ -42,7 +48,7 @@ const REGISTRY: &[(&str, usize, &str)] = &[
     (
         "dpdfnet8",
         16_000,
-        "DPDFNet-8 16 kHz (highest quality 16 kHz)",
+        "DPDFNet-8 16 kHz (highest quality 16 kHz, offline only)",
     ),
     (
         "dpdfnet2_48khz_hr",
@@ -52,7 +58,7 @@ const REGISTRY: &[(&str, usize, &str)] = &[
     (
         "dpdfnet8_48khz_hr",
         48_000,
-        "DPDFNet-8 48 kHz hi-res (full-band, highest quality)",
+        "DPDFNet-8 48 kHz hi-res (full-band, highest quality, offline only)",
     ),
 ];
 

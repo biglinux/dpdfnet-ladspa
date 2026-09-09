@@ -13,18 +13,27 @@ build = "build.rs"
 # `[lib]` block stays generic so `cargo build` works for any model.
 [lib]
 name = "dpdfnet_ladspa"
-crate-type = ["cdylib"]
+# `rlib` alongside the plugin so integration tests can drive the real
+# `run()` callback. It does not change the shipped `.so`.
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
 
 [dependencies]
 ladspa = "0.3"
+# Only for `sched_setscheduler`: the audio thread waits for our worker, so the
+# worker has to outrank ordinary work or the wait becomes scheduling luck.
+# Already in the lock file as a transitive dependency, so this adds nothing to
+# the build.
+libc = "0.2"
 # OpenVINO 2026.x is the system runtime on BigLinux (provided by the
-# `openvino` package). The Rust bindings link to libopenvino_c.so via
-# pkg-config; we use the system install rather than runtime-linking so
-# the LADSPA .so loads without a DT_NEEDED workaround at host start.
-openvino = "0.10"
+# `openvino` package). `runtime-linking` makes the bindings `dlopen` it on
+# first use instead of recording a versioned `DT_NEEDED`. Linking at build
+# time pinned the soname of the day — an `openvino` update then bumped it
+# and every DPDFNet plugin stopped loading (2610 → 2620 → 2630), which the
+# host saw as a missing plugin and a crash-looping mic unit.
+openvino = { version = "0.10", features = ["runtime-linking"] }
 realfft = "3.4"
 
 [profile.release]
